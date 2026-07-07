@@ -1,0 +1,40 @@
+ # Data files
+ data/train/
+ data/test/
+ data/*.parquet
+ data/*.csv
+
+ # Model outputs
+ *.pkl
+ *.joblib
+ *.bin
+ model/
+ models/
+
+ # Python
+ __pycache__/
+ *.pyc
+ *.pyo
+ *.egg-info/
+ *.egg
+ dist/
+ build/
+
+ # IDE
+ .vscode/
+ .idea/
+ *.swp
+ *.swo
+ *~
+
+ # OS
+ .DS_Store
+ Thumbs.db
+
+ # Outputs
+ output/
+ submissions/
+ *.log
+
+ # Jupyter
+ .ipynb_checkpoints/
