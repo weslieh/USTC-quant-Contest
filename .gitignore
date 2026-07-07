@@ -1,40 +1,40 @@
- # Data files
- data/train/
- data/test/
- data/*.parquet
- data/*.csv
+# Data files (large, not tracked)
+data/train/
+data/test/
+data/*.parquet
+data/*.csv
 
- # Model outputs
- *.pkl
- *.joblib
- *.bin
- model/
- models/
+# Model outputs
+*.pkl
+*.joblib
+*.bin
+model/
+models/
 
- # Python
- __pycache__/
- *.pyc
- *.pyo
- *.egg-info/
- *.egg
- dist/
- build/
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.egg
+dist/
+build/
 
- # IDE
- .vscode/
- .idea/
- *.swp
- *.swo
- *~
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
 
- # OS
- .DS_Store
- Thumbs.db
+# OS
+.DS_Store
+Thumbs.db
 
- # Outputs
- output/
- submissions/
- *.log
+# Outputs
+output/
+submissions/
+*.log
 
- # Jupyter
- .ipynb_checkpoints/
+# Jupyter
+.ipynb_checkpoints/
