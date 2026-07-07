@@ -55,11 +55,11 @@ def select_top_responders(
     n_sample = max(10000, int(len(df) * sample_frac))
     sample = df.sample(n=n_sample, seed=42) if len(df) > n_sample else df
 
-    target = sample["target"].to_numpy(dtype=np.float64, copy=False)
+    target = sample["target"].to_numpy().astype(np.float64)
     corrs = {}
 
     for c in responder_cols:
-        vals = sample[c].to_numpy(dtype=np.float64, copy=False)
+        vals = sample[c].to_numpy().astype(np.float64)
         mask = np.isfinite(vals) & np.isfinite(target)
         if mask.sum() < 100:
             continue
@@ -80,7 +80,7 @@ def train_responder_models(
 
     models = {}
     for col in responder_cols:
-        y = df[col].to_numpy(dtype=np.float64, copy=False)
+        y = df[col].to_numpy().astype(np.float64)
         mask = np.isfinite(y)
         if mask.sum() < 10:
             continue
