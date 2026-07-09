@@ -10,6 +10,8 @@ data/*.csv
 *.bin
 model/
 models/
+strategy/model.txt
+strategy/model_meta.json
 
 # Python
 __pycache__/
@@ -33,6 +35,7 @@ Thumbs.db
 
 # Outputs
 output/
+out/
 submissions/
 *.log
 
