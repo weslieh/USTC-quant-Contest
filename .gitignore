@@ -12,6 +12,7 @@ model/
 models/
 strategy/model.txt
 strategy/model_meta.json
+strategy/cv/
 
 # Python
 __pycache__/
