@@ -1,0 +1,8 @@
+# Pinned to versions verified locally (Python 3.12).
+# Install: pip install -r requirements.txt
+polars==1.42.1
+lightgbm==4.6.0
+pandas>=2.0
+numpy>=1.26
+pyarrow>=14.0
+scikit-learn>=1.3

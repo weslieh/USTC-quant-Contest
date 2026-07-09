@@ -1,103 +1,188 @@
+import argparse
+import json
+from pathlib import Path
+
 import polars as pl
 import lightgbm as lgb
+import numpy as np
 
 from src.dataset import load_train
-from src.cv import time_split
-from src.features import get_feature_columns
-from src.features import build_features
+from src.cv import time_cv_split
+from src.features import (
+    get_feature_columns,
+    build_rolling_features,
+    fill_infinite,
+)
 from src.model import build_model
 from src.metrics import weighted_zero_mean_r2
 
-VALID_FRACTION = 0.8
 
-frame = load_train("data/train")
-
-
-max_time = (
-    frame
-    .select(pl.col("time_id").max())
-    .collect()
-    .item()
-)
-
-
-times = (
-    frame
-    .select("time_id")
-    .unique()
-    .sort("time_id")
-    .collect()["time_id"]
-)
-split_idx = int(len(times) * VALID_FRACTION)
-split_time = times[split_idx]
-
-train, valid = time_split(frame, split_time)
-
-train_df = train.collect()
-valid_df = valid.collect()
-
-feature_cols = get_feature_columns(train)
-
-X_train = (
-    train_df
-    .select(feature_cols)
-    .to_numpy()
-)
-
-X_valid = (
-    valid_df
-    .select(feature_cols)
-    .to_numpy()
-)
-
-y_train = train_df["target"].to_numpy()
-
-y_valid = valid_df["target"].to_numpy()
-
-w_train = train_df["weight"].to_numpy()
-
-w_valid = valid_df["weight"].to_numpy()
-
-train_set = lgb.Dataset(
-    X_train,
-    label=y_train,
-    weight=w_train,
-)
-
-valid_set = lgb.Dataset(
-    X_valid,
-    label=y_valid,
-    weight=w_valid,
-)
+def parse_args():
+    p = argparse.ArgumentParser(description="Train LightGBM target model with time-series CV.")
+    p.add_argument("--data-root", default="data", help="Data root containing manifest.json (or the train dir).")
+    p.add_argument("--partitions", type=int, default=None, help="Limit to first N train partitions (memory control).")
+    p.add_argument("--n-folds", type=int, default=3)
+    p.add_argument("--valid-frac", type=float, default=0.1)
+    p.add_argument("--rolling-windows", type=int, nargs="*", default=[], help="Rolling/lag feature windows; empty = raw features only (memory-safe).")
+    p.add_argument("--out-dir", default="strategy", help="Directory for model + CV checkpoint artifacts.")
+    p.add_argument("--save-model", action="store_true", help="Save the final model + feature columns for inference.")
+    p.add_argument("--fresh", action="store_true", help="Ignore existing CV checkpoints and retrain all folds.")
+    return p.parse_args()
 
 
+def main():
+    args = parse_args()
 
-model = build_model()
+    out_dir = Path(args.out_dir)
+    cv_dir = out_dir / "cv"
+    scores_path = cv_dir / "scores.json"
+    model_path = out_dir / "model.txt"
+    meta_path = out_dir / "model_meta.json"
 
-model.fit(
-    X_train,
-    y_train,
+    print("Loading data ...")
+    frame = load_train(args.data_root, partitions=args.partitions)
 
-    sample_weight=w_train,
+    time_ids = (
+        frame
+        .select("time_id")
+        .unique()
+        .sort("time_id")
+        .collect()["time_id"]
+    )
+    print(f"  time_ids: {len(time_ids)}")
+    print(f"  folds: {args.n_folds}  valid_frac: {args.valid_frac}")
+    print(f"  rolling windows: {args.rolling_windows}")
+    print(f"  out_dir: {out_dir}")
 
-    eval_set=[
-        (X_valid, y_valid)
-    ],
+    feature_cols = get_feature_columns(frame)
+    print(f"  feature columns: {len(feature_cols)}")
 
-    eval_metric="l2",
+    folds = time_cv_split(frame, n_folds=args.n_folds, valid_frac=args.valid_frac)
+    print(f"\n  running {len(folds)}-fold expanding-window CV ...\n")
 
-    callbacks=[
-        lgb.early_stopping(100),
-        lgb.log_evaluation(50),
-    ]
-)
+    # Resume support: load previously completed fold scores so a spot/抢占式
+    # interruption only costs the in-flight fold. CV split is deterministic
+    # (sorted time_id), so per-fold indices line up across runs.
+    scores = []
+    if (not args.fresh) and scores_path.exists():
+        try:
+            saved = json.loads(scores_path.read_text(encoding="utf-8"))
+            scores = list(saved.get("scores", []))
+            print(f"  resuming: {len(scores)} fold(s) already completed")
+        except Exception as exc:
+            print(f"  could not parse {scores_path}: {exc}; starting fresh")
+            scores = []
 
-pred = model.predict(X_valid)
+    last_booster = None
+    last_best_iter = None
+    use_rolling = bool(args.rolling_windows)
+    cv_dir.mkdir(parents=True, exist_ok=True)
 
-score = weighted_zero_mean_r2(
-    y_valid,
-    pred,
-    w_valid,
-)
+    for fold_idx, (train_lf, valid_lf) in enumerate(folds):
+        if fold_idx < len(scores):
+            # Already done — load its booster as the running last_booster so
+            # --save-model still has something if all folds were cached.
+            fold_model = cv_dir / f"fold_{fold_idx}.txt"
+            if fold_model.exists():
+                last_booster = lgb.Booster(model_file=str(fold_model))
+            print(f"--- Fold {fold_idx + 1} / {len(folds)} (cached, score={scores[fold_idx]:.6f}) ---")
+            continue
 
-print(score)
+        print(f"--- Fold {fold_idx + 1} / {len(folds)} ---")
+
+        train_df = train_lf.collect()
+        valid_df = valid_lf.collect()
+
+        train_times = sorted(train_df["time_id"].unique().to_list())
+        valid_times = sorted(valid_df["time_id"].unique().to_list())
+        print(f"  train time_ids: {len(train_times)}  valid time_ids: {len(valid_times)}")
+        print(f"  train rows: {len(train_df)}  valid rows: {len(valid_df)}")
+
+        if use_rolling:
+            combined = pl.concat([train_df, valid_df])
+            combined = build_rolling_features(combined, feature_cols, windows=tuple(args.rolling_windows))
+            combined = fill_infinite(combined, feature_cols)
+            train_rolled = combined.filter(pl.col("time_id").is_in(train_times))
+            valid_rolled = combined.filter(pl.col("time_id").is_in(valid_times))
+            all_feature_cols = [c for c in train_rolled.columns if c.startswith("feature_")]
+            X_train = train_rolled.select(all_feature_cols).to_numpy().astype(np.float32)
+            X_valid = valid_rolled.select(all_feature_cols).to_numpy().astype(np.float32)
+            del combined, train_rolled, valid_rolled
+        else:
+            all_feature_cols = list(feature_cols)
+            X_train = train_df.select(all_feature_cols).to_numpy().astype(np.float32)
+            X_valid = valid_df.select(all_feature_cols).to_numpy().astype(np.float32)
+
+        y_train = train_df["target"].to_numpy().astype(np.float32)
+        y_valid = valid_df["target"].to_numpy().astype(np.float32)
+        w_train = train_df["weight"].to_numpy().astype(np.float32)
+        w_valid = valid_df["weight"].to_numpy().astype(np.float32)
+
+        model = build_model()
+        model.fit(
+            X_train, y_train,
+            sample_weight=w_train,
+            eval_set=[(X_valid, y_valid)],
+            eval_metric="l2",
+            callbacks=[lgb.early_stopping(100), lgb.log_evaluation(50)],
+        )
+        best_iter = model.best_iteration_
+        del X_train
+        pred = model.predict(X_valid)
+        del X_valid
+        score = weighted_zero_mean_r2(y_valid, pred, w_valid)
+        print(f"  CV score: {score:.6f}")
+
+        # Checkpoint this fold before moving on.
+        model.booster_.save_model(str(cv_dir / f"fold_{fold_idx}.txt"))
+        scores.append(float(score))
+        scores_path.write_text(json.dumps({"scores": scores}, indent=2), encoding="utf-8")
+        last_booster = model.booster_
+        last_best_iter = best_iter
+
+    print(f"\n{'=' * 50}")
+    print(f"CV scores: {[f'{s:.6f}' for s in scores]}")
+    if scores:
+        mean_s = float(np.mean(scores))
+        std_s = float(np.std(scores))
+        print(f"Mean CV: {mean_s:.6f}  Std: {std_s:.6f}")
+
+    if args.save_model:
+        if last_booster is None:
+            print("\nNo model trained; skipping save.")
+            return
+        # Retrain on ALL available time_ids for the deployed model so it sees
+        # the most recent market regime. NOTE: rolling features multiply the
+        # feature count ~5x and blow up memory on a 32GB box at full scale;
+        # for the first deployable submission we keep the model on the raw
+        # features only so it fits and so inference needs no state.
+        print("\nRetraining final model on full data (raw features) ...")
+        full_df = frame.select(feature_cols + ["weight", "target"]).collect()
+        X_full = full_df.select(feature_cols).to_numpy().astype(np.float32)
+        y_full = full_df["target"].to_numpy().astype(np.float32)
+        w_full = full_df["weight"].to_numpy().astype(np.float32)
+        deploy_feature_cols = list(feature_cols)
+        del full_df
+
+        # Default the deployed tree count to the last fold's best iteration;
+        # fall back to the configured max if everything came from cache.
+        n_est = last_best_iter if last_best_iter else 2000
+        final_model = build_model(n_estimators=max(1, n_est))
+        final_model.fit(X_full, y_full, sample_weight=w_full, callbacks=[lgb.log_evaluation(100)])
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+        final_model.booster_.save_model(str(model_path))
+        meta = {
+            "feature_columns": deploy_feature_cols,
+            "n_features": len(deploy_feature_cols),
+            "rolling_windows": [],
+            "cv_mean": float(np.mean(scores)) if scores else None,
+            "cv_std": float(np.std(scores)) if scores else None,
+        }
+        meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        print(f"Saved model -> {model_path}")
+        print(f"Saved meta  -> {meta_path}  ({len(deploy_feature_cols)} features)")
+
+
+if __name__ == "__main__":
+    main()
