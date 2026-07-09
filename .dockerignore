@@ -1,0 +1,41 @@
+# Keep the 20GB+ data and generated artifacts out of the build context.
+# Data is mounted at runtime (DATA_ROOT), never baked into the image.
+data/
+out/
+output/
+submissions/
+*.csv
+*.parquet
+*.log
+
+# Model / checkpoint artifacts (regenerated inside the container)
+strategy/model.txt
+strategy/model_meta.json
+strategy/cv/
+*.pkl
+*.joblib
+*.bin
+model/
+models/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# Local IDE / OS clutter
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+.ipynb_checkpoints/
+
+# VCS
+.git/
+.gitignore
+
+# Plans / memory (local-only Claude files)
+.claude/
