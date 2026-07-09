@@ -35,7 +35,6 @@ Thumbs.db
 
 # VCS
 .git/
-.gitignore
 
 # Plans / memory (local-only Claude files)
 .claude/

@@ -22,18 +22,12 @@ WORKDIR /workspace
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the project source. Data/ is excluded via .dockerignore.
-COPY src/ ./src/
-COPY train.py eda.py eeda.py ./
-COPY timeseries_api/ ./timeseries_api/
-COPY examples/ ./examples/
-COPY strategy/main.py ./strategy/main.py
-COPY README.md .gitignore ./
-
-COPY scripts/train-entrypoint.sh /usr/local/bin/train-entrypoint.sh
-RUN chmod +x /usr/local/bin/train-entrypoint.sh
+# Copy all project source in a single layer. .dockerignore keeps data/,
+# model artifacts, .git/, and .claude/ out of the image.
+COPY . .
+RUN chmod +x scripts/train-entrypoint.sh
 
 # Platforms mount input data at DATA_ROOT and read artifacts from OUT_DIR.
 # Override the command/args on the platform if you need non-default flags.
-ENTRYPOINT ["/usr/local/bin/train-entrypoint.sh"]
+ENTRYPOINT ["scripts/train-entrypoint.sh"]
 CMD []
