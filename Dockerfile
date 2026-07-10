@@ -18,6 +18,10 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /workspace
 
+# libgomp1: OpenMP runtime required by LightGBM's bundled .so (absent in -slim).
+RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
 # Install dependencies first (cached layer; code changes won't bust it).
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
