@@ -151,27 +151,18 @@ def main():
         if last_booster is None:
             print("\nNo model trained; skipping save.")
             return
-        # Retrain on ALL available time_ids for the deployed model so it sees
-        # the most recent market regime. NOTE: rolling features multiply the
-        # feature count ~5x and blow up memory on a 32GB box at full scale;
-        # for the first deployable submission we keep the model on the raw
-        # features only so it fits and so inference needs no state.
-        print("\nRetraining final model on full data (raw features) ...")
-        full_df = frame.select(feature_cols + ["weight", "target"]).collect()
-        X_full = full_df.select(feature_cols).to_numpy().astype(np.float32)
-        y_full = full_df["target"].to_numpy().astype(np.float32)
-        w_full = full_df["weight"].to_numpy().astype(np.float32)
+        # Deploy the LAST fold's booster directly. The last fold is trained on
+        # the most recent (largest) expanding window, so it already sees the
+        # latest market regime — a separate full-data retrain adds no signal
+        # and a full LazyFrame collect here has been observed to deadlock
+        # (0% CPU, no I/O) after the CV folds hold the data. Skipping it is
+        # both faster and safer. last_booster is either the just-trained
+        # last fold or the one loaded from its checkpoint on resume.
+        print("\nSaving last fold's booster as the deploy model ...")
         deploy_feature_cols = list(feature_cols)
-        del full_df
-
-        # Default the deployed tree count to the last fold's best iteration;
-        # fall back to the configured max if everything came from cache.
-        n_est = last_best_iter if last_best_iter else 2000
-        final_model = build_model(n_estimators=max(1, n_est))
-        final_model.fit(X_full, y_full, sample_weight=w_full, callbacks=[lgb.log_evaluation(100)])
 
         out_dir.mkdir(parents=True, exist_ok=True)
-        final_model.booster_.save_model(str(model_path))
+        last_booster.save_model(str(model_path))
         meta = {
             "feature_columns": deploy_feature_cols,
             "n_features": len(deploy_feature_cols),
