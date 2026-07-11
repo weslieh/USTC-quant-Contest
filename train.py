@@ -122,16 +122,21 @@ def main():
         # train OR valid — so computing per-group is strictly causal (no valid
         # info leaks into train, no future time_id used). No concat needed.
         if use_cs:
+            print(f"  building cross-sectional features (train: {len(train_df)} rows)...")
             train_df = build_cross_sectional_features(train_df, feature_cols)
+            print(f"  building cross-sectional features (valid: {len(valid_df)} rows)...")
             valid_df = build_cross_sectional_features(valid_df, feature_cols)
+            print(f"  cs done, cols: {len(train_df.columns)}")
 
         if use_rolling:
             combined = pl.concat([train_df, valid_df])
             del train_df, valid_df
             gc.collect()
 
+            print(f"  building rolling features (combined: {len(combined)} rows, windows={args.rolling_windows})...")
             combined = build_rolling_features(combined, feature_cols, windows=tuple(args.rolling_windows))
             combined = fill_infinite(combined, feature_cols)
+            print(f"  rolling done, cols: {len(combined.columns)}")
 
             all_feature_cols = [c for c in combined.columns if c.startswith("feature_")]
 
