@@ -11,6 +11,7 @@ submissions/
 # Model / checkpoint artifacts (regenerated inside the container)
 strategy/model.txt
 strategy/model_meta.json
+strategy/booster_fold_*.txt
 strategy/cv/
 *.pkl
 *.joblib
