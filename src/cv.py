@@ -19,16 +19,22 @@ def time_cv_split(
     df,
     n_folds=5,
     valid_frac=0.1,
+    embargo=0,
 ):
     """
     Expanding-window time-series cross-validation.
     Each fold uses more training data than the previous one.
 
-    Example with n_folds=5, 100 time_ids:
+    ``embargo`` drops that many time_ids between the end of train and the start
+    of valid, so neither set touches the boundary — reduces leakage from
+    near-adjacent time_ids.
+
+    Example with n_folds=5, 100 time_ids, embargo=0:
       fold 0: train=[0:50], valid=[50:60]
       fold 1: train=[0:60], valid=[60:70]
       ...
       fold 4: train=[0:90], valid=[90:100]
+    With embargo=e: fold i train=[0:valid_start-e], valid=[valid_start:valid_end].
     """
     import numpy as np
 
@@ -48,10 +54,11 @@ def time_cv_split(
         valid_end = n_total - (n_folds - fold - 1) * valid_size
         valid_start = valid_end - valid_size
 
-        if valid_start <= 0:
+        train_end = valid_start - embargo
+        if train_end <= 0 or valid_start <= 0:
             continue
 
-        train_ids = times[:valid_start].tolist()
+        train_ids = times[:train_end].tolist()
         valid_ids = times[valid_start:valid_end].tolist()
 
         train = df.filter(pl.col("time_id").is_in(train_ids))

@@ -10,24 +10,94 @@ from src.dataset import load_train
 from src.cv import time_cv_split
 from src.features import (
     get_feature_columns,
+    build_cross_sectional_features,
     build_rolling_features,
     fill_infinite,
 )
-from src.model import build_model
+from src.model import build_model, weighted_r2_eval
 from src.metrics import weighted_zero_mean_r2
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="Train LightGBM target model with time-series CV.")
-    p.add_argument("--data-root", default="data", help="Data root containing manifest.json (or the train dir).")
-    p.add_argument("--partitions", type=int, default=None, help="Limit to first N train partitions (memory control).")
-    p.add_argument("--n-folds", type=int, default=3)
+    p.add_argument("--data-root", default="data")
+    p.add_argument("--partitions", type=int, default=None, help="Limit to first N train partitions.")
+    p.add_argument("--n-folds", type=int, default=5)
     p.add_argument("--valid-frac", type=float, default=0.1)
-    p.add_argument("--rolling-windows", type=int, nargs="*", default=[], help="Rolling/lag feature windows; empty = raw features only (memory-safe).")
-    p.add_argument("--out-dir", default="strategy", help="Directory for model + CV checkpoint artifacts.")
-    p.add_argument("--save-model", action="store_true", help="Save the final model + feature columns for inference.")
-    p.add_argument("--fresh", action="store_true", help="Ignore existing CV checkpoints and retrain all folds.")
+    p.add_argument("--embargo", type=int, default=0, help="Time-id gap between train end and valid start.")
+    # Feature engineering
+    p.add_argument("--cs-topk", type=int, default=25, help="Top-K raw features for cross-sectional derivs (0=off).")
+    p.add_argument("--rolling-windows", type=int, nargs="*", default=[], help="Rolling windows (empty=off).")
+    p.add_argument("--rolling-topk", type=int, default=20, help="Top-K raw features for rolling (0=all 323).")
+    p.add_argument("--importance-sample", type=int, default=1_000_000, help="Rows for pilot importance.")
+    # Hyperparameters
+    p.add_argument("--num-leaves", type=int, default=64)
+    p.add_argument("--lr", type=float, default=0.03)
+    p.add_argument("--n-est", type=int, default=2000)
+    p.add_argument("--min-child-samples", type=int, default=20)
+    p.add_argument("--feature-frac", type=float, default=0.8)
+    p.add_argument("--bagging-frac", type=float, default=0.8)
+    p.add_argument("--bagging-freq", type=int, default=1)
+    p.add_argument("--reg-alpha", type=float, default=0.1)
+    p.add_argument("--reg-lambda", type=float, default=0.1)
+    p.add_argument("--early-stopping-rounds", type=int, default=100)
+    # IO
+    p.add_argument("--out-dir", default="strategy")
+    p.add_argument("--save-model", action="store_true")
+    p.add_argument("--fresh", action="store_true")
     return p.parse_args()
+
+
+def select_topk_by_importance(frame, raw_feature_cols, k, sample_rows, build_kwargs):
+    """Pilot-fit on a sample with raw features, return top-k feature names by gain."""
+    if k <= 0 or k >= len(raw_feature_cols):
+        return list(raw_feature_cols)
+    print(f"  pilot importance fit on up to {sample_rows} rows ...")
+    sample = frame.head(sample_rows).collect()
+    X = sample.select(raw_feature_cols).to_numpy().astype(np.float32)
+    y = sample["target"].to_numpy().astype(np.float32)
+    w = sample["weight"].to_numpy().astype(np.float32)
+    pilot = build_model(n_estimators=300, learning_rate=0.05, num_leaves=63,
+                        min_child_samples=100, **{kk: vv for kk, vv in build_kwargs.items()
+                                                  if kk in ("feature_fraction", "bagging_fraction",
+                                                            "bagging_freq", "reg_alpha", "reg_lambda")})
+    pilot.fit(X, y, sample_weight=w)
+    imp = dict(zip(raw_feature_cols, pilot.feature_importances_.tolist()))
+    top = sorted(imp, key=imp.get, reverse=True)[:k]
+    del sample, X, y, w, pilot
+    return top
+
+
+def build_fold_features(train_df, valid_df, raw_cols, cs_source_cols, rolling_source_cols, rolling_windows):
+    """Attach cross-sectional + rolling features to a fold's train/valid.
+
+    Cross-sectional features are stateless per time_id. Rolling features are
+    computed independently on train and valid (each fresh-starting) so the
+    valid fold mimics inference, where the per-asset history buffer starts
+    empty — no train history leaks into valid rolling stats.
+    """
+    new_cs_cols = []
+    new_roll_cols = []
+
+    def _attach(df, cs_src, roll_src, wins):
+        out = df
+        cs_cols = []
+        if cs_src:
+            out, cs_cols = build_cross_sectional_features(out, cs_src)
+        # Rolling column names are deterministic from source + windows.
+        roll_cols = []
+        if roll_src and wins:
+            out = build_rolling_features(out, roll_src, windows=tuple(wins))
+            for s in roll_src:
+                roll_cols.append(f"{s}_lag1")
+                for w in wins:
+                    roll_cols += [f"{s}_rm_{w}", f"{s}_rs_{w}"]
+        return out, cs_cols, roll_cols
+
+    train_out, train_cs, train_roll = _attach(train_df, cs_source_cols, rolling_source_cols, rolling_windows)
+    valid_out, valid_cs, valid_roll = _attach(valid_df, cs_source_cols, rolling_source_cols, rolling_windows)
+    # cs/roll column name sets are identical across train/valid (same sources).
+    return train_out, valid_out, train_cs, train_roll
 
 
 def main():
@@ -36,33 +106,55 @@ def main():
     out_dir = Path(args.out_dir)
     cv_dir = out_dir / "cv"
     scores_path = cv_dir / "scores.json"
-    model_path = out_dir / "model.txt"
     meta_path = out_dir / "model_meta.json"
 
     print("Loading data ...")
     frame = load_train(args.data_root, partitions=args.partitions)
 
     time_ids = (
-        frame
-        .select("time_id")
-        .unique()
-        .sort("time_id")
-        .collect()["time_id"]
+        frame.select("time_id").unique().sort("time_id").collect()["time_id"]
     )
     print(f"  time_ids: {len(time_ids)}")
-    print(f"  folds: {args.n_folds}  valid_frac: {args.valid_frac}")
-    print(f"  rolling windows: {args.rolling_windows}")
-    print(f"  out_dir: {out_dir}")
+    print(f"  folds: {args.n_folds}  valid_frac: {args.valid_frac}  embargo: {args.embargo}")
 
-    feature_cols = get_feature_columns(frame)
-    print(f"  feature columns: {len(feature_cols)}")
+    raw_feature_cols = get_feature_columns(frame)
+    print(f"  raw feature columns: {len(raw_feature_cols)}")
 
-    folds = time_cv_split(frame, n_folds=args.n_folds, valid_frac=args.valid_frac)
+    # Sanitize rolling windows: drop non-positive values; empty means off.
+    rolling_windows = [w for w in args.rolling_windows if w > 0]
+    if rolling_windows != args.rolling_windows:
+        print(f"  rolling_windows sanitized -> {rolling_windows}")
+    print(f"  cs_topk: {args.cs_topk}  rolling_windows: {rolling_windows}  rolling_topk: {args.rolling_topk}")
+
+    build_kwargs = dict(
+        num_leaves=args.num_leaves, learning_rate=args.lr, n_estimators=args.n_est,
+        min_child_samples=args.min_child_samples, feature_fraction=args.feature_frac,
+        bagging_fraction=args.bagging_frac, bagging_freq=args.bagging_freq,
+        reg_alpha=args.reg_alpha, reg_lambda=args.reg_lambda,
+    )
+
+    # Selective top-K source columns for cs / rolling (fixed across folds & inference).
+    cs_source_cols = []
+    rolling_source_cols = []
+    need_selection = args.cs_topk > 0 or (rolling_windows and args.rolling_topk > 0)
+    if need_selection:
+        all_top = select_topk_by_importance(
+            frame, raw_feature_cols,
+            k=max(args.cs_topk, args.rolling_topk if args.rolling_topk > 0 else 0),
+            sample_rows=args.importance_sample, build_kwargs=build_kwargs,
+        )
+        if args.cs_topk > 0:
+            cs_source_cols = all_top[:args.cs_topk]
+            print(f"  cs source cols ({len(cs_source_cols)}): {cs_source_cols[:5]} ...")
+        if rolling_windows and args.rolling_topk > 0:
+            rolling_source_cols = all_top[:args.rolling_topk]
+            print(f"  rolling source cols ({len(rolling_source_cols)}): {rolling_source_cols[:5]} ...")
+        elif rolling_windows:
+            rolling_source_cols = list(raw_feature_cols)
+
+    folds = time_cv_split(frame, n_folds=args.n_folds, valid_frac=args.valid_frac, embargo=args.embargo)
     print(f"\n  running {len(folds)}-fold expanding-window CV ...\n")
 
-    # Resume support: load previously completed fold scores so a spot/抢占式
-    # interruption only costs the in-flight fold. CV split is deterministic
-    # (sorted time_id), so per-fold indices line up across runs.
     scores = []
     if (not args.fresh) and scores_path.exists():
         try:
@@ -73,18 +165,15 @@ def main():
             print(f"  could not parse {scores_path}: {exc}; starting fresh")
             scores = []
 
-    last_booster = None
-    last_best_iter = None
-    use_rolling = bool(args.rolling_windows)
     cv_dir.mkdir(parents=True, exist_ok=True)
+    fold_boosters = []  # (fold_idx, booster, best_iter)
+    target_std = None
 
     for fold_idx, (train_lf, valid_lf) in enumerate(folds):
         if fold_idx < len(scores):
-            # Already done — load its booster as the running last_booster so
-            # --save-model still has something if all folds were cached.
             fold_model = cv_dir / f"fold_{fold_idx}.txt"
             if fold_model.exists():
-                last_booster = lgb.Booster(model_file=str(fold_model))
+                fold_boosters.append((fold_idx, lgb.Booster(model_file=str(fold_model)), None))
             print(f"--- Fold {fold_idx + 1} / {len(folds)} (cached, score={scores[fold_idx]:.6f}) ---")
             continue
 
@@ -98,81 +187,95 @@ def main():
         print(f"  train time_ids: {len(train_times)}  valid time_ids: {len(valid_times)}")
         print(f"  train rows: {len(train_df)}  valid rows: {len(valid_df)}")
 
-        if use_rolling:
-            combined = pl.concat([train_df, valid_df])
-            combined = build_rolling_features(combined, feature_cols, windows=tuple(args.rolling_windows))
-            combined = fill_infinite(combined, feature_cols)
-            train_rolled = combined.filter(pl.col("time_id").is_in(train_times))
-            valid_rolled = combined.filter(pl.col("time_id").is_in(valid_times))
-            all_feature_cols = [c for c in train_rolled.columns if c.startswith("feature_")]
-            X_train = train_rolled.select(all_feature_cols).to_numpy().astype(np.float32)
-            X_valid = valid_rolled.select(all_feature_cols).to_numpy().astype(np.float32)
-            del combined, train_rolled, valid_rolled
-        else:
-            all_feature_cols = list(feature_cols)
-            X_train = train_df.select(all_feature_cols).to_numpy().astype(np.float32)
-            X_valid = valid_df.select(all_feature_cols).to_numpy().astype(np.float32)
+        train_df, valid_df, cs_cols, roll_cols = build_fold_features(
+            train_df, valid_df, raw_feature_cols, cs_source_cols, rolling_source_cols, rolling_windows,
+        )
+        # fill inf -> 0 on engineered cols; raw NaN left for LGBM native handling
+        if cs_cols or roll_cols:
+            train_df = fill_infinite(train_df, cs_cols + roll_cols)
+            valid_df = fill_infinite(valid_df, cs_cols + roll_cols)
 
+        all_feature_cols = list(raw_feature_cols) + cs_cols + roll_cols
+        X_train = train_df.select(all_feature_cols).to_numpy().astype(np.float32)
+        X_valid = valid_df.select(all_feature_cols).to_numpy().astype(np.float32)
         y_train = train_df["target"].to_numpy().astype(np.float32)
         y_valid = valid_df["target"].to_numpy().astype(np.float32)
         w_train = train_df["weight"].to_numpy().astype(np.float32)
         w_valid = valid_df["weight"].to_numpy().astype(np.float32)
 
-        model = build_model()
+        if target_std is None:
+            target_std = float(np.std(y_train))
+
+        model = build_model(**build_kwargs)
         model.fit(
             X_train, y_train,
             sample_weight=w_train,
-            eval_set=[(X_valid, y_valid)],
-            eval_metric="l2",
-            callbacks=[lgb.early_stopping(100), lgb.log_evaluation(50)],
+            eval_set=[(X_valid, y_valid, w_valid)],
+            eval_metric=weighted_r2_eval,
+            callbacks=[lgb.early_stopping(args.early_stopping_rounds, verbose=False), lgb.log_evaluation(50)],
         )
         best_iter = model.best_iteration_
         del X_train
         pred = model.predict(X_valid)
         del X_valid
         score = weighted_zero_mean_r2(y_valid, pred, w_valid)
-        print(f"  CV score: {score:.6f}")
+        print(f"  CV score: {score:.6f}  best_iter: {best_iter}")
 
-        # Checkpoint this fold before moving on.
         model.booster_.save_model(str(cv_dir / f"fold_{fold_idx}.txt"))
         scores.append(float(score))
         scores_path.write_text(json.dumps({"scores": scores}, indent=2), encoding="utf-8")
-        last_booster = model.booster_
-        last_best_iter = best_iter
+        fold_boosters.append((fold_idx, model.booster_, best_iter))
+        del train_df, valid_df, y_train, y_valid, w_train, w_valid, model
 
     print(f"\n{'=' * 50}")
     print(f"CV scores: {[f'{s:.6f}' for s in scores]}")
     if scores:
-        mean_s = float(np.mean(scores))
-        std_s = float(np.std(scores))
-        print(f"Mean CV: {mean_s:.6f}  Std: {std_s:.6f}")
+        print(f"Mean CV: {float(np.mean(scores)):.6f}  Std: {float(np.std(scores)):.6f}")
 
     if args.save_model:
-        if last_booster is None:
+        if not fold_boosters:
             print("\nNo model trained; skipping save.")
             return
-        # Deploy the LAST fold's booster directly. The last fold is trained on
-        # the most recent (largest) expanding window, so it already sees the
-        # latest market regime — a separate full-data retrain adds no signal
-        # and a full LazyFrame collect here has been observed to deadlock
-        # (0% CPU, no I/O) after the CV folds hold the data. Skipping it is
-        # both faster and safer. last_booster is either the just-trained
-        # last fold or the one loaded from its checkpoint on resume.
-        print("\nSaving last fold's booster as the deploy model ...")
-        deploy_feature_cols = list(feature_cols)
-
+        print(f"\nSaving {len(fold_boosters)} fold boosters as the deploy ensemble ...")
         out_dir.mkdir(parents=True, exist_ok=True)
-        last_booster.save_model(str(model_path))
+        saved_fold_files = []
+        for fold_idx, booster, _ in fold_boosters:
+            fname = f"booster_fold_{fold_idx}.txt"
+            booster.save_model(str(out_dir / fname))
+            saved_fold_files.append(fname)
+
+        # Final feature column order = raw + cs + rolling (matches build_fold_features).
+        cs_cols, roll_cols = [], []
+        if cs_source_cols:
+            cs_cols = []
+            for s in cs_source_cols:
+                cs_cols += [f"{s}_cs_rank", f"{s}_cs_z", f"{s}_cs_dm"]
+        if rolling_source_cols and rolling_windows:
+            roll_cols = []
+            for s in rolling_source_cols:
+                roll_cols.append(f"{s}_lag1")
+                for w in rolling_windows:
+                    roll_cols += [f"{s}_rm_{w}", f"{s}_rs_{w}"]
+        all_feature_cols = list(raw_feature_cols) + cs_cols + roll_cols
+
         meta = {
-            "feature_columns": deploy_feature_cols,
-            "n_features": len(deploy_feature_cols),
-            "rolling_windows": [],
+            "feature_columns": all_feature_cols,
+            "raw_feature_columns": list(raw_feature_cols),
+            "cs_source_columns": cs_source_cols,
+            "cs_feature_columns": cs_cols,
+            "rolling_source_columns": rolling_source_cols,
+            "rolling_feature_columns": roll_cols,
+            "rolling_windows": list(rolling_windows),
+            "n_folds": len(fold_boosters),
+            "fold_files": saved_fold_files,
+            "target_std": target_std,
             "cv_mean": float(np.mean(scores)) if scores else None,
             "cv_std": float(np.std(scores)) if scores else None,
+            "hparams": build_kwargs,
         }
         meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-        print(f"Saved model -> {model_path}")
-        print(f"Saved meta  -> {meta_path}  ({len(deploy_feature_cols)} features)")
+        print(f"Saved {len(fold_boosters)} boosters -> {out_dir}")
+        print(f"Saved meta -> {meta_path}  ({len(all_feature_cols)} features)")
 
 
 if __name__ == "__main__":

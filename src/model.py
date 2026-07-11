@@ -2,23 +2,62 @@ import numpy as np
 from lightgbm import LGBMRegressor
 
 
-def build_model(n_estimators=2000, learning_rate=0.03):
-    """Build a LightGBM regressor with sensible defaults for target prediction."""
+def build_model(
+    n_estimators=2000,
+    learning_rate=0.03,
+    num_leaves=64,
+    min_child_samples=20,
+    feature_fraction=0.8,
+    bagging_fraction=0.8,
+    bagging_freq=1,
+    reg_alpha=0.1,
+    reg_lambda=0.1,
+):
+    """Build a LightGBM regressor for target prediction.
+
+    All hyperparameters are exposed so train.py can sweep them from the CLI.
+    """
 
     model = LGBMRegressor(
         objective="regression",
         n_estimators=n_estimators,
         learning_rate=learning_rate,
-        num_leaves=64,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_alpha=0.1,
-        reg_lambda=0.1,
+        num_leaves=num_leaves,
+        min_child_samples=min_child_samples,
+        feature_fraction=feature_fraction,
+        bagging_fraction=bagging_fraction,
+        bagging_freq=bagging_freq,
+        reg_alpha=reg_alpha,
+        reg_lambda=reg_lambda,
         random_state=42,
         n_jobs=-1,
         verbosity=-1,
     )
     return model
+
+
+def weighted_r2_eval(y_true, y_pred, weight):
+    """Custom LightGBM eval metric matching the competition's weighted zero-mean R².
+
+    sklearn-API signature ``(y_true, y_pred, weight)`` — LightGBM injects the
+    eval set's sample_weight automatically when ``eval_sample_weight`` is
+    passed to ``fit`` (via the (X, y, w) tuple in ``eval_set``). Returns
+    ``(name, value, is_higher_better)`` so early stopping optimises the exact
+    leaderboard metric instead of unweighted L2.
+    """
+
+    y_true = np.asarray(y_true, dtype=np.float64)
+    y_pred = np.asarray(y_pred, dtype=np.float64)
+    w = np.asarray(weight, dtype=np.float64)
+    if w.size != y_true.size:
+        w = np.ones_like(y_true)
+
+    denominator = np.sum(w * y_true * y_true)
+    if denominator <= 0:
+        return ("weighted_r2", 0.0, True)
+    numerator = np.sum(w * (y_true - y_pred) ** 2)
+    score = float(1.0 - numerator / denominator)
+    return ("weighted_r2", score, True)
 
 
 def build_responder_model():
