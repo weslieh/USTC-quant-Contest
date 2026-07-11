@@ -139,7 +139,7 @@ def main():
             # avoid having both combined (~189 GB) and X_train (~170 GB) in
             # RAM simultaneously. Write to memmap files, then read back after
             # freeing combined.
-            time_ids_arr = combined.select("time_id").to_numpy()
+            time_ids_arr = combined["time_id"].to_numpy()
             train_mask = np.isin(time_ids_arr, np.array(train_times))
             valid_mask = np.isin(time_ids_arr, np.array(valid_times))
             del time_ids_arr
