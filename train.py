@@ -1,4 +1,5 @@
 import argparse
+import gc
 import json
 from pathlib import Path
 
@@ -14,7 +15,7 @@ from src.features import (
     build_cross_sectional_features,
     fill_infinite,
 )
-from src.model import build_model
+from src.model import build_model, get_lgb_params
 from src.metrics import weighted_zero_mean_r2
 
 
@@ -104,6 +105,18 @@ def main():
         print(f"  train time_ids: {len(train_times)}  valid time_ids: {len(valid_times)}")
         print(f"  train rows: {len(train_df)}  valid rows: {len(valid_df)}")
 
+        # Extract y/w BEFORE feature engineering so we can free the
+        # full DataFrames (with responders/target/weight) early.
+        y_train = train_df["target"].to_numpy().astype(np.float32)
+        y_valid = valid_df["target"].to_numpy().astype(np.float32)
+        w_train = train_df["weight"].to_numpy().astype(np.float32)
+        w_valid = valid_df["weight"].to_numpy().astype(np.float32)
+
+        # Drop columns not needed for feature engineering to save memory.
+        keep_cols = ["time_id", "asset_id"] + list(feature_cols)
+        train_df = train_df.select(keep_cols)
+        valid_df = valid_df.select(keep_cols)
+
         # Cross-sectional features are computed per time_id within each split.
         # Since folds partition by time_id, each time_id lives entirely in
         # train OR valid — so computing per-group is strictly causal (no valid
@@ -114,47 +127,113 @@ def main():
 
         if use_rolling:
             combined = pl.concat([train_df, valid_df])
+            del train_df, valid_df
+            gc.collect()
+
             combined = build_rolling_features(combined, feature_cols, windows=tuple(args.rolling_windows))
             combined = fill_infinite(combined, feature_cols)
-            train_rolled = combined.filter(pl.col("time_id").is_in(train_times))
-            valid_rolled = combined.filter(pl.col("time_id").is_in(valid_times))
-            all_feature_cols = [c for c in train_rolled.columns if c.startswith("feature_")]
-            X_train = train_rolled.select(all_feature_cols).to_numpy().astype(np.float32)
-            X_valid = valid_rolled.select(all_feature_cols).to_numpy().astype(np.float32)
-            del combined, train_rolled, valid_rolled
+
+            all_feature_cols = [c for c in combined.columns if c.startswith("feature_")]
+
+            # Column-batch + memmap: process combined in column batches to
+            # avoid having both combined (~189 GB) and X_train (~170 GB) in
+            # RAM simultaneously. Write to memmap files, then read back after
+            # freeing combined.
+            time_ids_arr = combined.select("time_id").to_numpy()
+            train_mask = np.isin(time_ids_arr, np.array(train_times))
+            valid_mask = np.isin(time_ids_arr, np.array(valid_times))
+            del time_ids_arr
+
+            train_n = int(train_mask.sum())
+            valid_n = int(valid_mask.sum())
+            n_feat = len(all_feature_cols)
+
+            tmp_dir = out_dir / "tmp"
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            x_train_path = str(tmp_dir / f"fold_{fold_idx}_xtrain.dat")
+            x_valid_path = str(tmp_dir / f"fold_{fold_idx}_xvalid.dat")
+
+            for p in [x_train_path, x_valid_path]:
+                Path(p).unlink(missing_ok=True)
+
+            X_train_mm = np.memmap(
+                x_train_path, dtype=np.float32, mode="w+",
+                shape=(train_n, n_feat),
+            )
+            X_valid_mm = np.memmap(
+                x_valid_path, dtype=np.float32, mode="w+",
+                shape=(valid_n, n_feat),
+            )
+
+            # Each batch: 15 columns from combined → to_numpy → mask → memmap.
+            # Peak: combined + batch(~0.8 GB) = ~190 GB.
+            batch_cols = 15
+            for ci in range(0, n_feat, batch_cols):
+                ce = min(ci + batch_cols, n_feat)
+                cols = all_feature_cols[ci:ce]
+                X_batch = combined.select(cols).to_numpy().astype(np.float32)
+                X_train_mm[:, ci:ce] = X_batch[train_mask]
+                X_valid_mm[:, ci:ce] = X_batch[valid_mask]
+                del X_batch
+
+            X_train_mm.flush()
+            X_valid_mm.flush()
+            del X_train_mm, X_valid_mm
+            del combined
+            gc.collect()
+
+            # Reopen as read-only memmap (OS pages data on demand, minimal RAM).
+            X_train = np.memmap(
+                x_train_path, dtype=np.float32, mode="r",
+                shape=(train_n, n_feat),
+            )
+            X_valid = np.memmap(
+                x_valid_path, dtype=np.float32, mode="r",
+                shape=(valid_n, n_feat),
+            )
         else:
             # All derived cols (csrank/csz/csdm) are named feature_*_<suffix>,
             # so startswith("feature_") covers everything.
             all_feature_cols = [c for c in train_df.columns if c.startswith("feature_")]
             X_train = train_df.select(all_feature_cols).to_numpy().astype(np.float32)
             X_valid = valid_df.select(all_feature_cols).to_numpy().astype(np.float32)
+            del train_df, valid_df
+            gc.collect()
 
-        y_train = train_df["target"].to_numpy().astype(np.float32)
-        y_valid = valid_df["target"].to_numpy().astype(np.float32)
-        w_train = train_df["weight"].to_numpy().astype(np.float32)
-        w_valid = valid_df["weight"].to_numpy().astype(np.float32)
+        # Train with lgb.Dataset + lgb.train() for memory efficiency
+        # (sklearn API may create extra copies of the data).
+        params = get_lgb_params()
+        train_set = lgb.Dataset(X_train, label=y_train, weight=w_train)
+        valid_set = lgb.Dataset(
+            X_valid, label=y_valid, weight=w_valid, reference=train_set,
+        )
 
-        model = build_model()
-        model.fit(
-            X_train, y_train,
-            sample_weight=w_train,
-            eval_set=[(X_valid, y_valid)],
-            eval_metric="l2",
+        model = lgb.train(
+            params,
+            train_set,
+            num_boost_round=2000,
+            valid_sets=[valid_set],
             callbacks=[lgb.early_stopping(100), lgb.log_evaluation(50)],
         )
-        best_iter = model.best_iteration_
+        best_iter = model.best_iteration
         del X_train
+        gc.collect()
         pred = model.predict(X_valid)
         del X_valid
         score = weighted_zero_mean_r2(y_valid, pred, w_valid)
         print(f"  CV score: {score:.6f}")
 
         # Checkpoint this fold before moving on.
-        model.booster_.save_model(str(cv_dir / f"fold_{fold_idx}.txt"))
+        model.save_model(str(cv_dir / f"fold_{fold_idx}.txt"))
         scores.append(float(score))
         scores_path.write_text(json.dumps({"scores": scores}, indent=2), encoding="utf-8")
-        last_booster = model.booster_
+        last_booster = model
         last_best_iter = best_iter
+
+        # Clean up memmap temp files for this fold.
+        if use_rolling:
+            for p in [x_train_path, x_valid_path]:
+                Path(p).unlink(missing_ok=True)
 
     print(f"\n{'=' * 50}")
     print(f"CV scores: {[f'{s:.6f}' for s in scores]}")

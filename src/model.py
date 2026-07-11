@@ -2,6 +2,25 @@ import numpy as np
 from lightgbm import LGBMRegressor
 
 
+def get_lgb_params(n_estimators=2000, learning_rate=0.03):
+    """Return LightGBM parameter dict for lgb.train(). Equivalent to build_model() params."""
+
+    return {
+        "objective": "regression",
+        "num_leaves": 64,
+        "learning_rate": learning_rate,
+        "feature_fraction": 0.8,
+        "bagging_fraction": 0.8,
+        "bagging_freq": 1,
+        "lambda_l1": 0.1,
+        "lambda_l2": 0.1,
+        "verbose": -1,
+        "num_threads": -1,
+        "seed": 42,
+        "metric": "l2",
+    }
+
+
 def build_model(n_estimators=2000, learning_rate=0.03):
     """Build a LightGBM regressor with sensible defaults for target prediction."""
 
