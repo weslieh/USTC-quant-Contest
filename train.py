@@ -11,6 +11,7 @@ from src.cv import time_cv_split
 from src.features import (
     get_feature_columns,
     build_rolling_features,
+    build_cross_sectional_features,
     fill_infinite,
 )
 from src.model import build_model
@@ -24,6 +25,9 @@ def parse_args():
     p.add_argument("--n-folds", type=int, default=3)
     p.add_argument("--valid-frac", type=float, default=0.1)
     p.add_argument("--rolling-windows", type=int, nargs="*", default=[], help="Rolling/lag feature windows; empty = raw features only (memory-safe).")
+    p.add_argument("--cross-sectional", action="store_true", default=True, help="Add per-time_id cross-sectional rank/zscore/demean (default on; --no-cross-sectional to disable).")
+    p.add_argument("--no-cross-sectional", dest="cross_sectional", action="store_false", help="Disable cross-sectional features.")
+    p.add_argument("--gap", type=int, default=5, help="Number of time_ids to exclude between train and valid (purge gap for autocorrelation).")
     p.add_argument("--out-dir", default="strategy", help="Directory for model + CV checkpoint artifacts.")
     p.add_argument("--save-model", action="store_true", help="Save the final model + feature columns for inference.")
     p.add_argument("--fresh", action="store_true", help="Ignore existing CV checkpoints and retrain all folds.")
@@ -50,14 +54,15 @@ def main():
         .collect()["time_id"]
     )
     print(f"  time_ids: {len(time_ids)}")
-    print(f"  folds: {args.n_folds}  valid_frac: {args.valid_frac}")
+    print(f"  folds: {args.n_folds}  valid_frac: {args.valid_frac}  gap: {args.gap}")
     print(f"  rolling windows: {args.rolling_windows}")
+    print(f"  cross-sectional: {args.cross_sectional}")
     print(f"  out_dir: {out_dir}")
 
     feature_cols = get_feature_columns(frame)
     print(f"  feature columns: {len(feature_cols)}")
 
-    folds = time_cv_split(frame, n_folds=args.n_folds, valid_frac=args.valid_frac)
+    folds = time_cv_split(frame, n_folds=args.n_folds, valid_frac=args.valid_frac, gap=args.gap)
     print(f"\n  running {len(folds)}-fold expanding-window CV ...\n")
 
     # Resume support: load previously completed fold scores so a spot/抢占式
@@ -76,6 +81,7 @@ def main():
     last_booster = None
     last_best_iter = None
     use_rolling = bool(args.rolling_windows)
+    use_cs = bool(args.cross_sectional)
     cv_dir.mkdir(parents=True, exist_ok=True)
 
     for fold_idx, (train_lf, valid_lf) in enumerate(folds):
@@ -98,6 +104,14 @@ def main():
         print(f"  train time_ids: {len(train_times)}  valid time_ids: {len(valid_times)}")
         print(f"  train rows: {len(train_df)}  valid rows: {len(valid_df)}")
 
+        # Cross-sectional features are computed per time_id within each split.
+        # Since folds partition by time_id, each time_id lives entirely in
+        # train OR valid — so computing per-group is strictly causal (no valid
+        # info leaks into train, no future time_id used). No concat needed.
+        if use_cs:
+            train_df = build_cross_sectional_features(train_df, feature_cols)
+            valid_df = build_cross_sectional_features(valid_df, feature_cols)
+
         if use_rolling:
             combined = pl.concat([train_df, valid_df])
             combined = build_rolling_features(combined, feature_cols, windows=tuple(args.rolling_windows))
@@ -109,7 +123,9 @@ def main():
             X_valid = valid_rolled.select(all_feature_cols).to_numpy().astype(np.float32)
             del combined, train_rolled, valid_rolled
         else:
-            all_feature_cols = list(feature_cols)
+            # All derived cols (csrank/csz/csdm) are named feature_*_<suffix>,
+            # so startswith("feature_") covers everything.
+            all_feature_cols = [c for c in train_df.columns if c.startswith("feature_")]
             X_train = train_df.select(all_feature_cols).to_numpy().astype(np.float32)
             X_valid = valid_df.select(all_feature_cols).to_numpy().astype(np.float32)
 
@@ -159,14 +175,41 @@ def main():
         # both faster and safer. last_booster is either the just-trained
         # last fold or the one loaded from its checkpoint on resume.
         print("\nSaving last fold's booster as the deploy model ...")
-        deploy_feature_cols = list(feature_cols)
+
+        # Determine the full feature set the booster was trained on. On a
+        # fresh run all_feature_cols is set by the last fold; on a fully-cached
+        # resume it is undefined, so reconstruct it from the args + schema.
+        if "all_feature_cols" not in dir() or not all_feature_cols:
+            cols = list(feature_cols)
+            if use_cs:
+                cols += [
+                    s
+                    for c in feature_cols
+                    for s in (f"{c}_csrank", f"{c}_csz", f"{c}_csdm")
+                ]
+            if use_rolling:
+                cols += [
+                    s
+                    for c in feature_cols
+                    for s in (f"{c}_lag1",)
+                ]
+                cols += [
+                    s
+                    for c in feature_cols
+                    for w in args.rolling_windows
+                    for s in (f"{c}_rm_{w}", f"{c}_rs_{w}")
+                ]
+            all_feature_cols = cols
+        deploy_feature_cols = list(all_feature_cols)
 
         out_dir.mkdir(parents=True, exist_ok=True)
         last_booster.save_model(str(model_path))
         meta = {
             "feature_columns": deploy_feature_cols,
             "n_features": len(deploy_feature_cols),
-            "rolling_windows": [],
+            "rolling_windows": list(args.rolling_windows) if use_rolling else [],
+            "cross_sectional": use_cs,
+            "gap": args.gap,
             "cv_mean": float(np.mean(scores)) if scores else None,
             "cv_std": float(np.std(scores)) if scores else None,
         }
