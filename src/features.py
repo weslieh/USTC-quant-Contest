@@ -42,9 +42,9 @@ def build_cross_sectional_features(df, feature_cols):
         n = col.count().over("time_id")
         # fractional rank in [0, 1]; guard divide-by-zero when a slice has 1 row
         rank_frac = pl.when(n > 1).then((col.rank("average") - 1) / (n - 1)).otherwise(0.5)
-        exprs.append(rank_frac.alias(f"{c}_csrank"))
-        exprs.append(((col - mean) / std).alias(f"{c}_csz"))
-        exprs.append((col - mean).alias(f"{c}_csdm"))
+        exprs.append(rank_frac.cast(pl.Float32).alias(f"{c}_csrank"))
+        exprs.append(((col - mean) / std).cast(pl.Float32).alias(f"{c}_csz"))
+        exprs.append((col - mean).cast(pl.Float32).alias(f"{c}_csdm"))
     return df.with_columns(exprs)
 
 
@@ -65,7 +65,7 @@ def build_rolling_features(
     # lag-1: previous value for the same asset
     for c in feature_cols:
         exprs.append(
-            pl.col(c).shift(1).over("asset_id").alias(f"{c}_lag1")
+            pl.col(c).shift(1).over("asset_id").cast(pl.Float32).alias(f"{c}_lag1")
         )
 
     # rolling mean and std per asset for each window
@@ -75,12 +75,14 @@ def build_rolling_features(
                 pl.col(c)
                 .rolling_mean(window_size=w, min_periods=1)
                 .over("asset_id")
+                .cast(pl.Float32)
                 .alias(f"{c}_rm_{w}")
             )
             exprs.append(
                 pl.col(c)
                 .rolling_std(window_size=w, min_periods=1)
                 .over("asset_id")
+                .cast(pl.Float32)
                 .alias(f"{c}_rs_{w}")
             )
 
@@ -97,6 +99,7 @@ def fill_infinite(df, feature_cols):
             .then(None)
             .otherwise(pl.col(c))
             .fill_null(0.0)
+            .cast(pl.Float32)
             .alias(c)
         )
 

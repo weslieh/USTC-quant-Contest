@@ -195,6 +195,14 @@ def main():
             # All derived cols (csrank/csz/csdm) are named feature_*_<suffix>,
             # so startswith("feature_") covers everything.
             all_feature_cols = [c for c in train_df.columns if c.startswith("feature_")]
+            # Safety: verify all feature cols are float32 to prevent float64
+            # upcast in to_numpy() that would double memory.
+            col_dtypes = dict(zip(train_df.columns, train_df.dtypes))
+            non_f32 = [c for c in all_feature_cols if col_dtypes.get(c) != pl.Float32]
+            if non_f32:
+                print(f"  WARNING: {len(non_f32)} columns not float32, casting...")
+                train_df = train_df.with_columns([pl.col(c).cast(pl.Float32, strict=False) for c in non_f32])
+                valid_df = valid_df.with_columns([pl.col(c).cast(pl.Float32, strict=False) for c in non_f32])
             X_train = train_df.select(all_feature_cols).to_numpy().astype(np.float32)
             X_valid = valid_df.select(all_feature_cols).to_numpy().astype(np.float32)
             del train_df, valid_df
