@@ -120,10 +120,18 @@ class Model:
         self.rolling_windows = list(meta.get("rolling_windows", []))
         self.feature_columns = list(meta["feature_columns"])  # full ordered list
         self.target_std = float(meta.get("target_std") or 1.0)
+        self.backend = meta.get("backend", "lgb")
 
         self.boosters = []
-        for fname in meta.get("fold_files", []):
-            self.boosters.append(lgb.Booster(model_file=str(here / fname)))
+        if self.backend == "xgb":
+            from xgboost import XGBRegressor
+            for fname in meta.get("fold_files", []):
+                m = XGBRegressor()
+                m.load_model(str(here / fname))
+                self.boosters.append(m)
+        else:
+            for fname in meta.get("fold_files", []):
+                self.boosters.append(lgb.Booster(model_file=str(here / fname)))
         if not self.boosters:  # legacy single model
             self.boosters.append(lgb.Booster(model_file=str(here / "model.txt")))
 

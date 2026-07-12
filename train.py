@@ -17,7 +17,6 @@ from src.features import (
 from src.model import build_model, weighted_r2_eval
 from src.metrics import weighted_zero_mean_r2
 
-
 def parse_args():
     p = argparse.ArgumentParser(description="Train LightGBM target model with time-series CV.")
     p.add_argument("--data-root", default="data")
@@ -41,6 +40,14 @@ def parse_args():
     p.add_argument("--reg-alpha", type=float, default=0.1)
     p.add_argument("--reg-lambda", type=float, default=0.1)
     p.add_argument("--early-stopping-rounds", type=int, default=100)
+    # Backend
+    p.add_argument("--backend", choices=["lgb", "xgb"], default="lgb",
+                   help="Trainer backend: lgb=LightGBM, xgb=XGBoost.")
+    # XGBoost-specific hyperparameters (ignored when --backend lgb)
+    p.add_argument("--xgb-max-depth", type=int, default=6)
+    p.add_argument("--xgb-min-child-weight", type=float, default=5.0)
+    p.add_argument("--xgb-subsample", type=float, default=0.8)
+    p.add_argument("--xgb-colsample", type=float, default=0.8)
     # IO
     p.add_argument("--out-dir", default="strategy")
     p.add_argument("--save-model", action="store_true")
@@ -166,14 +173,19 @@ def main():
             scores = []
 
     cv_dir.mkdir(parents=True, exist_ok=True)
-    fold_boosters = []  # (fold_idx, booster, best_iter)
+    fold_boosters = []  # (fold_idx, (backend, booster_or_path), best_iter)
     target_std = None
 
     for fold_idx, (train_lf, valid_lf) in enumerate(folds):
         if fold_idx < len(scores):
-            fold_model = cv_dir / f"fold_{fold_idx}.txt"
-            if fold_model.exists():
-                fold_boosters.append((fold_idx, lgb.Booster(model_file=str(fold_model)), None))
+            if args.backend == "xgb":
+                fmodel = cv_dir / f"fold_{fold_idx}.json"
+                if fmodel.exists():
+                    fold_boosters.append((fold_idx, ("xgb", str(fmodel)), None))
+            else:
+                fmodel = cv_dir / f"fold_{fold_idx}.txt"
+                if fmodel.exists():
+                    fold_boosters.append((fold_idx, ("lgb", lgb.Booster(model_file=str(fmodel))), None))
             print(f"--- Fold {fold_idx + 1} / {len(folds)} (cached, score={scores[fold_idx]:.6f}) ---")
             continue
 
@@ -206,6 +218,36 @@ def main():
         if target_std is None:
             target_std = float(np.std(y_train))
 
+        if args.backend == "xgb":
+            from src.model_xgb import build_xgb_model
+            model = build_xgb_model(
+                n_estimators=args.n_est, learning_rate=args.lr,
+                max_depth=args.xgb_max_depth, min_child_weight=args.xgb_min_child_weight,
+                subsample=args.xgb_subsample, colsample_bytree=args.xgb_colsample,
+                reg_alpha=args.reg_alpha, reg_lambda=args.reg_lambda,
+                early_stopping_rounds=args.early_stopping_rounds,
+            )
+            model.fit(
+                X_train, y_train,
+                sample_weight=w_train,
+                eval_set=[(X_valid, y_valid)],
+                sample_weight_eval_set=[w_valid],
+                verbose=False,
+            )
+            best_iter = getattr(model, "best_iteration", None)
+            del X_train
+            pred = model.predict(X_valid)
+            del X_valid
+            score = weighted_zero_mean_r2(y_valid, pred, w_valid)
+            print(f"  CV score: {score:.6f}  best_iter: {best_iter}")
+            # Save XGB fold as json (native format); load with XGBRegressor in inference.
+            model.save_model(str(cv_dir / f"fold_{fold_idx}.json"))
+            scores.append(float(score))
+            scores_path.write_text(json.dumps({"scores": scores}, indent=2), encoding="utf-8")
+            fold_boosters.append((fold_idx, ("xgb", str(cv_dir / f"fold_{fold_idx}.json")), best_iter))
+            del train_df, valid_df, y_train, y_valid, w_train, w_valid, model
+            continue
+
         model = build_model(**build_kwargs)
         model.fit(
             X_train, y_train,
@@ -224,7 +266,7 @@ def main():
         model.booster_.save_model(str(cv_dir / f"fold_{fold_idx}.txt"))
         scores.append(float(score))
         scores_path.write_text(json.dumps({"scores": scores}, indent=2), encoding="utf-8")
-        fold_boosters.append((fold_idx, model.booster_, best_iter))
+        fold_boosters.append((fold_idx, ("lgb", model.booster_), best_iter))
         del train_df, valid_df, y_train, y_valid, w_train, w_valid, model
 
     print(f"\n{'=' * 50}")
@@ -236,12 +278,17 @@ def main():
         if not fold_boosters:
             print("\nNo model trained; skipping save.")
             return
-        print(f"\nSaving {len(fold_boosters)} fold boosters as the deploy ensemble ...")
+        import shutil
+        print(f"\nSaving {len(fold_boosters)} fold boosters ({args.backend}) as the deploy ensemble ...")
         out_dir.mkdir(parents=True, exist_ok=True)
         saved_fold_files = []
-        for fold_idx, booster, _ in fold_boosters:
-            fname = f"booster_fold_{fold_idx}.txt"
-            booster.save_model(str(out_dir / fname))
+        for fold_idx, (backend, booster_or_path), _ in fold_boosters:
+            if backend == "xgb":
+                fname = f"booster_fold_{fold_idx}.json"
+                shutil.copyfile(booster_or_path, str(out_dir / fname))
+            else:
+                fname = f"booster_fold_{fold_idx}.txt"
+                booster_or_path.save_model(str(out_dir / fname))
             saved_fold_files.append(fname)
 
         # Final feature column order = raw + cs + rolling (matches build_fold_features).
@@ -259,6 +306,7 @@ def main():
         all_feature_cols = list(raw_feature_cols) + cs_cols + roll_cols
 
         meta = {
+            "backend": args.backend,
             "feature_columns": all_feature_cols,
             "raw_feature_columns": list(raw_feature_cols),
             "cs_source_columns": cs_source_cols,
