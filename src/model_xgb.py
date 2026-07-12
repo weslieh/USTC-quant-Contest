@@ -21,9 +21,12 @@ def build_xgb_model(
     it with ``min_child_weight`` (sum of instance weight in a leaf) which plays
     the same anti-overfit role as LightGBM's ``min_child_samples``.
 
-    ``eval_metric`` and ``early_stopping_rounds`` are set on the estimator
-    (XGBoost 2.x removed them from ``fit``). The custom weighted-R² metric and
-    ``maximize=True`` make early stopping optimise the leaderboard metric.
+    Early stopping uses the built-in weighted RMSE (XGBoost applies
+    ``sample_weight_eval_set`` to the metric automatically). A custom
+    weighted-R² feval with ``maximize=True`` was tried but XGBoost 3.x's
+    early-stopping/maximize interaction selected degenerate iterations
+    (best_iter=0, negative R²), so we rely on weighted RMSE minimisation,
+    which is a reliable proxy and stays positive on valid R².
     """
 
     model = XGBRegressor(
@@ -40,19 +43,16 @@ def build_xgb_model(
         n_jobs=-1,
         random_state=42,
         verbosity=0,
-        eval_metric=xgb_weighted_r2,
+        eval_metric="rmse",
         early_stopping_rounds=early_stopping_rounds,
-        maximize=True,
     )
     return model
 
 
 def xgb_weighted_r2(y_true, y_pred, sample_weight=None):
-    """Custom XGBoost eval metric = competition's weighted zero-mean R².
+    """Competition weighted zero-mean R² — kept for manual scoring only.
 
-    XGBoost 3.x sklearn feval signature: ``func(y_true, y_score, sample_weight)``
-    returning a plain float. ``maximize=True`` (set on the estimator) makes
-    early stopping optimise this metric.
+    Not wired into early stopping (see build_xgb_model docstring).
     """
     w = sample_weight
     if w is None:
