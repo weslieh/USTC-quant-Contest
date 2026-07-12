@@ -41,8 +41,8 @@ def parse_args():
     p.add_argument("--reg-lambda", type=float, default=0.1)
     p.add_argument("--early-stopping-rounds", type=int, default=100)
     # Backend
-    p.add_argument("--backend", choices=["lgb", "xgb"], default="lgb",
-                   help="Trainer backend: lgb=LightGBM, xgb=XGBoost.")
+    p.add_argument("--backend", choices=["lgb", "xgb", "cat"], default="lgb",
+                   help="Trainer backend: lgb=LightGBM, xgb=XGBoost, cat=CatBoost.")
     p.add_argument("--seed", type=int, default=42,
                    help="Random seed for the model (multi-seed bagging: run with several seeds).")
     # XGBoost-specific hyperparameters (ignored when --backend lgb)
@@ -50,6 +50,9 @@ def parse_args():
     p.add_argument("--xgb-min-child-weight", type=float, default=5.0)
     p.add_argument("--xgb-subsample", type=float, default=0.8)
     p.add_argument("--xgb-colsample", type=float, default=0.8)
+    # CatBoost-specific hyperparameters (ignored when --backend is not cat)
+    p.add_argument("--cat-depth", type=int, default=7)
+    p.add_argument("--cat-l2-leaf-reg", type=float, default=3.0)
     # IO
     p.add_argument("--out-dir", default="strategy")
     p.add_argument("--save-model", action="store_true")
@@ -185,6 +188,10 @@ def main():
                 fmodel = cv_dir / f"fold_{fold_idx}.json"
                 if fmodel.exists():
                     fold_boosters.append((fold_idx, ("xgb", str(fmodel)), None))
+            elif args.backend == "cat":
+                fmodel = cv_dir / f"fold_{fold_idx}.cbm"
+                if fmodel.exists():
+                    fold_boosters.append((fold_idx, ("cat", str(fmodel)), None))
             else:
                 fmodel = cv_dir / f"fold_{fold_idx}.txt"
                 if fmodel.exists():
@@ -252,6 +259,31 @@ def main():
             del train_df, valid_df, y_train, y_valid, w_train, w_valid, model
             continue
 
+        if args.backend == "cat":
+            from src.model_cat import build_cat_model
+            from catboost import Pool
+            model = build_cat_model(
+                iterations=args.n_est, learning_rate=args.lr,
+                depth=args.cat_depth, l2_leaf_reg=args.cat_l2_leaf_reg,
+                random_seed=args.seed,
+                early_stopping_rounds=args.early_stopping_rounds,
+            )
+            train_pool = Pool(X_train, y_train, weight=w_train)
+            valid_pool = Pool(X_valid, y_valid, weight=w_valid)
+            model.fit(train_pool, eval_set=valid_pool)
+            best_iter = model.best_iteration_
+            del X_train
+            pred = model.predict(X_valid)
+            del X_valid
+            score = weighted_zero_mean_r2(y_valid, pred, w_valid)
+            print(f"  CV score: {score:.6f}  best_iter: {best_iter}")
+            model.save_model(str(cv_dir / f"fold_{fold_idx}.cbm"))
+            scores.append(float(score))
+            scores_path.write_text(json.dumps({"scores": scores}, indent=2), encoding="utf-8")
+            fold_boosters.append((fold_idx, ("cat", str(cv_dir / f"fold_{fold_idx}.cbm")), best_iter))
+            del train_df, valid_df, y_train, y_valid, w_train, w_valid, model, train_pool, valid_pool
+            continue
+
         model = build_model(**build_kwargs)
         model.fit(
             X_train, y_train,
@@ -289,6 +321,9 @@ def main():
         for fold_idx, (backend, booster_or_path), _ in fold_boosters:
             if backend == "xgb":
                 fname = f"booster_fold_{fold_idx}.json"
+                shutil.copyfile(booster_or_path, str(out_dir / fname))
+            elif backend == "cat":
+                fname = f"booster_fold_{fold_idx}.cbm"
                 shutil.copyfile(booster_or_path, str(out_dir / fname))
             else:
                 fname = f"booster_fold_{fold_idx}.txt"

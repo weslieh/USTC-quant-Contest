@@ -129,6 +129,12 @@ class Model:
                 m = XGBRegressor()
                 m.load_model(str(here / fname))
                 self.boosters.append(m)
+        elif self.backend == "cat":
+            from catboost import CatBoostRegressor
+            for fname in meta.get("fold_files", []):
+                m = CatBoostRegressor()
+                m.load_model(str(here / fname))
+                self.boosters.append(m)
         else:
             for fname in meta.get("fold_files", []):
                 self.boosters.append(lgb.Booster(model_file=str(here / fname)))
