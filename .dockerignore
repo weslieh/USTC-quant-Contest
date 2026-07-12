@@ -12,7 +12,14 @@ submissions/
 strategy/model.txt
 strategy/model_meta.json
 strategy/booster_fold_*.txt
+strategy/booster_fold_*.json
 strategy/cv/
+strategy_lgb/
+strategy_xgb/
+strategy_ensemble/ensemble_meta.json
+strategy_ensemble/booster_fold_*.txt
+strategy_ensemble/booster_fold_*.json
+strategy_ensemble/cv/
 *.pkl
 *.joblib
 *.bin
