@@ -12,10 +12,12 @@ def build_model(
     bagging_freq=1,
     reg_alpha=0.1,
     reg_lambda=0.1,
+    random_state=42,
 ):
     """Build a LightGBM regressor for target prediction.
 
     All hyperparameters are exposed so train.py can sweep them from the CLI.
+    ``random_state`` is exposed for multi-seed bagging ensembles.
     """
 
     model = LGBMRegressor(
@@ -29,7 +31,7 @@ def build_model(
         bagging_freq=bagging_freq,
         reg_alpha=reg_alpha,
         reg_lambda=reg_lambda,
-        random_state=42,
+        random_state=random_state,
         n_jobs=-1,
         verbosity=-1,
     )

@@ -14,6 +14,7 @@ def build_xgb_model(
     reg_alpha=0.1,
     reg_lambda=1.0,
     early_stopping_rounds=100,
+    random_state=42,
 ):
     """Build an XGBoost regressor mirroring the LightGBM setup.
 
@@ -41,7 +42,7 @@ def build_xgb_model(
         objective="reg:squarederror",
         tree_method="hist",
         n_jobs=-1,
-        random_state=42,
+        random_state=random_state,
         verbosity=0,
         eval_metric="rmse",
         early_stopping_rounds=early_stopping_rounds,

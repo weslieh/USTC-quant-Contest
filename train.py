@@ -43,6 +43,8 @@ def parse_args():
     # Backend
     p.add_argument("--backend", choices=["lgb", "xgb"], default="lgb",
                    help="Trainer backend: lgb=LightGBM, xgb=XGBoost.")
+    p.add_argument("--seed", type=int, default=42,
+                   help="Random seed for the model (multi-seed bagging: run with several seeds).")
     # XGBoost-specific hyperparameters (ignored when --backend lgb)
     p.add_argument("--xgb-max-depth", type=int, default=6)
     p.add_argument("--xgb-min-child-weight", type=float, default=5.0)
@@ -138,6 +140,7 @@ def main():
         min_child_samples=args.min_child_samples, feature_fraction=args.feature_frac,
         bagging_fraction=args.bagging_frac, bagging_freq=args.bagging_freq,
         reg_alpha=args.reg_alpha, reg_lambda=args.reg_lambda,
+        random_state=args.seed,
     )
 
     # Selective top-K source columns for cs / rolling (fixed across folds & inference).
@@ -226,6 +229,7 @@ def main():
                 subsample=args.xgb_subsample, colsample_bytree=args.xgb_colsample,
                 reg_alpha=args.reg_alpha, reg_lambda=args.reg_lambda,
                 early_stopping_rounds=args.early_stopping_rounds,
+                random_state=args.seed,
             )
             model.fit(
                 X_train, y_train,
