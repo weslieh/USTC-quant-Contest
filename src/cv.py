@@ -66,3 +66,5 @@ def time_cv_split(
         folds.append((train, valid))
 
     return folds
+
+from src.adversarial_cv import adversarial_cv_split

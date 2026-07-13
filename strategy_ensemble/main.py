@@ -86,8 +86,31 @@ class _SubModel:
         self.cs_source_columns = list(meta.get("cs_source_columns", []))
         self.rolling_source_columns = list(meta.get("rolling_source_columns", []))
         self.rolling_windows = list(meta.get("rolling_windows", []))
+
         self.boosters = []
-        if self.backend == "xgb":
+        if self.backend == "xgb_mt":
+            from xgboost import XGBRegressor, XGBClassifier
+            self.clf_boosters = []
+            self.reg_boosters = []
+            for fname in meta.get("fold_files", []):
+                clf = XGBClassifier()
+                clf.load_model(str(model_dir / f"{fname}_clf.json"))
+                self.clf_boosters.append(clf)
+                reg = XGBRegressor()
+                reg.load_model(str(model_dir / f"{fname}_reg.json"))
+                self.reg_boosters.append(reg)
+        elif self.backend == "cat_mt":
+            from catboost import CatBoostRegressor, CatBoostClassifier
+            self.clf_boosters = []
+            self.reg_boosters = []
+            for fname in meta.get("fold_files", []):
+                clf = CatBoostClassifier()
+                clf.load_model(str(model_dir / f"{fname}_clf.cbm"))
+                self.clf_boosters.append(clf)
+                reg = CatBoostRegressor()
+                reg.load_model(str(model_dir / f"{fname}_reg.cbm"))
+                self.reg_boosters.append(reg)
+        elif self.backend == "xgb":
             from xgboost import XGBRegressor
             for fname in meta.get("fold_files", []):
                 m = XGBRegressor()
@@ -105,9 +128,16 @@ class _SubModel:
 
     def predict(self, X):
         preds = np.zeros(X.shape[0], dtype=np.float64)
-        for b in self.boosters:
-            preds += b.predict(X)
-        return preds / len(self.boosters)
+        if self.backend in ("xgb_mt", "cat_mt"):
+            for clf, reg in zip(self.clf_boosters, self.reg_boosters):
+                pred_prob = clf.predict_proba(X)[:, 1]
+                pred_val = reg.predict(X)
+                preds += pred_prob * pred_val
+            return preds / len(self.reg_boosters)
+        else:
+            for b in self.boosters:
+                preds += b.predict(X)
+            return preds / len(self.boosters)
 
 
 class Model:
@@ -148,6 +178,13 @@ class Model:
             json.loads((self.subs[0].dir / "model_meta.json").read_text(encoding="utf-8"))
             .get("target_std") or 1.0
         )
+        s0_meta = json.loads((s0.dir / "model_meta.json").read_text(encoding="utf-8"))
+        self.neutralize_alpha = float(s0_meta.get("neutralize_alpha", 0.0))
+        self.neutralize_features = s0_meta.get("neutralize_features", [])
+        self._neutralize_src_idx = np.asarray(
+            [self.raw_feature_columns.index(c) for c in self.neutralize_features
+             if c in self.raw_feature_columns], dtype=np.intp
+        )
         self.rolling = _RollingBuf(len(self._roll_src_idx), self.rolling_windows)
         self.last_time_id: int | None = None
 
@@ -183,6 +220,12 @@ class Model:
         if self.last_time_id is not None and time_id <= self.last_time_id:
             raise ValueError("time_id must strictly increase in Time-Series API order")
         self.last_time_id = time_id
+
+        # Keep a copy of raw features for neutralization later
+        Xraw_full = test.to_numpy(dtype=np.float32, copy=True)
+        col_pos = test.columns.get_indexer(self.raw_feature_columns)
+        Xraw_full = Xraw_full[:, col_pos]
+
         X = self._build_features(test)
         np.nan_to_num(X, copy=False, nan=np.nan, posinf=0.0, neginf=0.0)
         total_w = sum(s.weight for s in self.subs) or 1.0
@@ -190,6 +233,19 @@ class Model:
         for s in self.subs:
             preds += s.weight * s.predict(X)
         preds /= total_w
+
+        if self.neutralize_alpha > 0.0 and self._neutralize_src_idx.size > 0:
+            import sys
+            import os
+            # Make sure we can import from src when running inside timeseries API
+            here = Path(__file__).resolve()
+            project_root = here.parent.parent
+            if str(project_root) not in sys.path:
+                sys.path.insert(0, str(project_root))
+            from src.neutralization import neutralize_predictions
+            neutral_features = Xraw_full[:, self._neutralize_src_idx]
+            preds = neutralize_predictions(preds, neutral_features, alpha=self.neutralize_alpha)
+
         clip = 3.0 * self.target_std
         preds = np.clip(preds, -clip, clip)
         bad = ~np.isfinite(preds)

@@ -7,7 +7,7 @@ import lightgbm as lgb
 import numpy as np
 
 from src.dataset import load_train
-from src.cv import time_cv_split
+from src.cv import time_cv_split, adversarial_cv_split
 from src.features import (
     get_feature_columns,
     build_cross_sectional_features,
@@ -24,6 +24,10 @@ def parse_args():
     p.add_argument("--n-folds", type=int, default=5)
     p.add_argument("--valid-frac", type=float, default=0.1)
     p.add_argument("--embargo", type=int, default=0, help="Time-id gap between train end and valid start.")
+    p.add_argument("--adv-val-ratio", type=float, default=0.0, help="Use adversarial validation split instead of time CV. 0=off.")
+    p.add_argument("--multi-task", action="store_true", help="Train dual models: target direction (classification) and target value (regression).")
+    p.add_argument("--neutralize-alpha", type=float, default=0.0, help="Proportion of neutralization to apply during inference against drift features. 0=off.")
+    p.add_argument("--neutralize-topk", type=int, default=10, help="Number of top drift features to neutralize against.")
     # Feature engineering
     p.add_argument("--cs-topk", type=int, default=25, help="Top-K raw features for cross-sectional derivs (0=off).")
     p.add_argument("--rolling-windows", type=int, nargs="*", default=[], help="Rolling windows (empty=off).")
@@ -138,6 +142,16 @@ def main():
         print(f"  rolling_windows sanitized -> {rolling_windows}")
     print(f"  cs_topk: {args.cs_topk}  rolling_windows: {rolling_windows}  rolling_topk: {args.rolling_topk}")
 
+    drift_features = []
+    if args.neutralize_alpha > 0 and args.neutralize_topk > 0:
+        from src.drift import compute_drift_rank
+        from src.dataset import _partition_paths
+        train_paths = _partition_paths(args.data_root, "train")
+        test_paths = _partition_paths(args.data_root, "test")
+        drift_rank = compute_drift_rank(train_paths, test_paths, list(raw_feature_cols), seed=args.seed)
+        drift_features = drift_rank[:args.neutralize_topk]
+        print(f"  neutralization drift features ({len(drift_features)}): {drift_features}")
+
     build_kwargs = dict(
         num_leaves=args.num_leaves, learning_rate=args.lr, n_estimators=args.n_est,
         min_child_samples=args.min_child_samples, feature_fraction=args.feature_frac,
@@ -165,8 +179,17 @@ def main():
         elif rolling_windows:
             rolling_source_cols = list(raw_feature_cols)
 
-    folds = time_cv_split(frame, n_folds=args.n_folds, valid_frac=args.valid_frac, embargo=args.embargo)
-    print(f"\n  running {len(folds)}-fold expanding-window CV ...\n")
+    if args.adv_val_ratio > 0:
+        print(f"\n  running adversarial validation split (ratio={args.adv_val_ratio}) ...\n")
+        folds = adversarial_cv_split(
+            frame, list(raw_feature_cols),
+            adv_val_ratio=args.adv_val_ratio,
+            sample_rows=args.importance_sample,
+            seed=args.seed
+        )
+    else:
+        folds = time_cv_split(frame, n_folds=args.n_folds, valid_frac=args.valid_frac, embargo=args.embargo)
+        print(f"\n  running {len(folds)}-fold expanding-window CV ...\n")
 
     scores = []
     if (not args.fresh) and scores_path.exists():
@@ -230,6 +253,70 @@ def main():
 
         if args.backend == "xgb":
             from src.model_xgb import build_xgb_model
+
+            if getattr(args, "multi_task", False):
+                # Target binary: 1 if target > 0 else 0
+                y_train_bin = (y_train > 0).astype(np.float32)
+                y_valid_bin = (y_valid > 0).astype(np.float32)
+
+                print("  Training Classifier...")
+                clf = build_xgb_model(
+                    n_estimators=args.n_est, learning_rate=args.lr,
+                    max_depth=args.xgb_max_depth, min_child_weight=args.xgb_min_child_weight,
+                    subsample=args.xgb_subsample, colsample_bytree=args.xgb_colsample,
+                    reg_alpha=args.reg_alpha, reg_lambda=args.reg_lambda,
+                    early_stopping_rounds=args.early_stopping_rounds,
+                    random_state=args.seed,
+                    task="classification"
+                )
+                clf.fit(
+                    X_train, y_train_bin,
+                    sample_weight=w_train,
+                    eval_set=[(X_valid, y_valid_bin)],
+                    sample_weight_eval_set=[w_valid],
+                    verbose=False,
+                )
+
+                print("  Training Regressor...")
+                reg = build_xgb_model(
+                    n_estimators=args.n_est, learning_rate=args.lr,
+                    max_depth=args.xgb_max_depth, min_child_weight=args.xgb_min_child_weight,
+                    subsample=args.xgb_subsample, colsample_bytree=args.xgb_colsample,
+                    reg_alpha=args.reg_alpha, reg_lambda=args.reg_lambda,
+                    early_stopping_rounds=args.early_stopping_rounds,
+                    random_state=args.seed,
+                    task="regression"
+                )
+                reg.fit(
+                    X_train, y_train,
+                    sample_weight=w_train,
+                    eval_set=[(X_valid, y_valid)],
+                    sample_weight_eval_set=[w_valid],
+                    verbose=False,
+                )
+
+                best_iter = getattr(reg, "best_iteration", None)
+                del X_train
+
+                pred_prob = clf.predict_proba(X_valid)[:, 1]
+                pred_val = reg.predict(X_valid)
+                # Combine predictions: simple scale or probability weighting
+                # Using a heuristic: probability of positive * raw prediction magnitude
+                # A more refined approach tunes this mapping. For now we use the probability.
+                pred = pred_prob * pred_val
+                del X_valid
+
+                score = weighted_zero_mean_r2(y_valid, pred, w_valid)
+                print(f"  CV score: {score:.6f}  best_iter(reg): {best_iter}")
+
+                clf.save_model(str(cv_dir / f"fold_{fold_idx}_clf.json"))
+                reg.save_model(str(cv_dir / f"fold_{fold_idx}_reg.json"))
+                scores.append(float(score))
+                scores_path.write_text(json.dumps({"scores": scores}, indent=2), encoding="utf-8")
+                fold_boosters.append((fold_idx, ("xgb_mt", str(cv_dir / f"fold_{fold_idx}")), best_iter))
+                del train_df, valid_df, y_train, y_valid, w_train, w_valid, clf, reg
+                continue
+
             model = build_xgb_model(
                 n_estimators=args.n_est, learning_rate=args.lr,
                 max_depth=args.xgb_max_depth, min_child_weight=args.xgb_min_child_weight,
@@ -262,6 +349,54 @@ def main():
         if args.backend == "cat":
             from src.model_cat import build_cat_model
             from catboost import Pool
+
+            if getattr(args, "multi_task", False):
+                y_train_bin = (y_train > 0).astype(np.float32)
+                y_valid_bin = (y_valid > 0).astype(np.float32)
+
+                print("  Training Classifier...")
+                clf = build_cat_model(
+                    iterations=args.n_est, learning_rate=args.lr,
+                    depth=args.cat_depth, l2_leaf_reg=args.cat_l2_leaf_reg,
+                    random_seed=args.seed,
+                    early_stopping_rounds=args.early_stopping_rounds,
+                    task="classification"
+                )
+                train_pool_bin = Pool(X_train, y_train_bin, weight=w_train)
+                valid_pool_bin = Pool(X_valid, y_valid_bin, weight=w_valid)
+                clf.fit(train_pool_bin, eval_set=valid_pool_bin)
+
+                print("  Training Regressor...")
+                reg = build_cat_model(
+                    iterations=args.n_est, learning_rate=args.lr,
+                    depth=args.cat_depth, l2_leaf_reg=args.cat_l2_leaf_reg,
+                    random_seed=args.seed,
+                    early_stopping_rounds=args.early_stopping_rounds,
+                    task="regression"
+                )
+                train_pool_reg = Pool(X_train, y_train, weight=w_train)
+                valid_pool_reg = Pool(X_valid, y_valid, weight=w_valid)
+                reg.fit(train_pool_reg, eval_set=valid_pool_reg)
+
+                best_iter = reg.best_iteration_
+                del X_train
+
+                pred_prob = clf.predict_proba(X_valid)[:, 1]
+                pred_val = reg.predict(X_valid)
+                pred = pred_prob * pred_val
+                del X_valid
+
+                score = weighted_zero_mean_r2(y_valid, pred, w_valid)
+                print(f"  CV score: {score:.6f}  best_iter(reg): {best_iter}")
+
+                clf.save_model(str(cv_dir / f"fold_{fold_idx}_clf.cbm"))
+                reg.save_model(str(cv_dir / f"fold_{fold_idx}_reg.cbm"))
+                scores.append(float(score))
+                scores_path.write_text(json.dumps({"scores": scores}, indent=2), encoding="utf-8")
+                fold_boosters.append((fold_idx, ("cat_mt", str(cv_dir / f"fold_{fold_idx}")), best_iter))
+                del train_df, valid_df, y_train, y_valid, w_train, w_valid, clf, reg, train_pool_bin, valid_pool_bin, train_pool_reg, valid_pool_reg
+                continue
+
             model = build_cat_model(
                 iterations=args.n_est, learning_rate=args.lr,
                 depth=args.cat_depth, l2_leaf_reg=args.cat_l2_leaf_reg,
@@ -310,7 +445,7 @@ def main():
     if scores:
         print(f"Mean CV: {float(np.mean(scores)):.6f}  Std: {float(np.std(scores)):.6f}")
 
-    if args.save_model:
+    if getattr(args, "save_model", False):
         if not fold_boosters:
             print("\nNo model trained; skipping save.")
             return
@@ -325,6 +460,21 @@ def main():
             elif backend == "cat":
                 fname = f"booster_fold_{fold_idx}.cbm"
                 shutil.copyfile(booster_or_path, str(out_dir / fname))
+            elif backend == "xgb_mt":
+                # Multi-task xgb saves two files
+                fname_clf = f"booster_fold_{fold_idx}_clf.json"
+                fname_reg = f"booster_fold_{fold_idx}_reg.json"
+                shutil.copyfile(f"{booster_or_path}_clf.json", str(out_dir / fname_clf))
+                shutil.copyfile(f"{booster_or_path}_reg.json", str(out_dir / fname_reg))
+                # For meta json we can just record the base name
+                fname = f"booster_fold_{fold_idx}"
+            elif backend == "cat_mt":
+                # Multi-task cat saves two files
+                fname_clf = f"booster_fold_{fold_idx}_clf.cbm"
+                fname_reg = f"booster_fold_{fold_idx}_reg.cbm"
+                shutil.copyfile(f"{booster_or_path}_clf.cbm", str(out_dir / fname_clf))
+                shutil.copyfile(f"{booster_or_path}_reg.cbm", str(out_dir / fname_reg))
+                fname = f"booster_fold_{fold_idx}"
             else:
                 fname = f"booster_fold_{fold_idx}.txt"
                 booster_or_path.save_model(str(out_dir / fname))
@@ -345,7 +495,7 @@ def main():
         all_feature_cols = list(raw_feature_cols) + cs_cols + roll_cols
 
         meta = {
-            "backend": args.backend,
+            "backend": args.backend + ("_mt" if getattr(args, "multi_task", False) else ""),
             "feature_columns": all_feature_cols,
             "raw_feature_columns": list(raw_feature_cols),
             "cs_source_columns": cs_source_cols,
@@ -353,6 +503,8 @@ def main():
             "rolling_source_columns": rolling_source_cols,
             "rolling_feature_columns": roll_cols,
             "rolling_windows": list(rolling_windows),
+            "neutralize_alpha": getattr(args, "neutralize_alpha", 0.0),
+            "neutralize_features": drift_features,
             "n_folds": len(fold_boosters),
             "fold_files": saved_fold_files,
             "target_std": target_std,

@@ -122,8 +122,39 @@ class Model:
         self.target_std = float(meta.get("target_std") or 1.0)
         self.backend = meta.get("backend", "lgb")
 
+        self.neutralize_alpha = meta.get("neutralize_alpha", 0.0)
+        self.neutralize_features = meta.get("neutralize_features", [])
+        self._neutralize_src_idx = np.asarray(
+            [self.raw_feature_columns.index(c) for c in self.neutralize_features
+             if c in self.raw_feature_columns], dtype=np.intp
+        )
+
         self.boosters = []
-        if self.backend == "xgb":
+        if self.backend == "xgb_mt":
+            from xgboost import XGBRegressor, XGBClassifier
+            self.clf_boosters = []
+            self.reg_boosters = []
+            for fname in meta.get("fold_files", []):
+                clf = XGBClassifier()
+                clf.load_model(str(here / f"{fname}_clf.json"))
+                self.clf_boosters.append(clf)
+
+                reg = XGBRegressor()
+                reg.load_model(str(here / f"{fname}_reg.json"))
+                self.reg_boosters.append(reg)
+        elif self.backend == "cat_mt":
+            from catboost import CatBoostRegressor, CatBoostClassifier
+            self.clf_boosters = []
+            self.reg_boosters = []
+            for fname in meta.get("fold_files", []):
+                clf = CatBoostClassifier()
+                clf.load_model(str(here / f"{fname}_clf.cbm"))
+                self.clf_boosters.append(clf)
+
+                reg = CatBoostRegressor()
+                reg.load_model(str(here / f"{fname}_reg.cbm"))
+                self.reg_boosters.append(reg)
+        elif self.backend == "xgb":
             from xgboost import XGBRegressor
             for fname in meta.get("fold_files", []):
                 m = XGBRegressor()
@@ -198,6 +229,11 @@ class Model:
             raise ValueError("time_id must strictly increase in Time-Series API order")
         self.last_time_id = time_id
 
+        # Keep a copy of raw features for neutralization later
+        Xraw_full = test.to_numpy(dtype=np.float32, copy=True)
+        col_pos = test.columns.get_indexer(self.raw_feature_columns)
+        Xraw_full = Xraw_full[:, col_pos]
+
         X = self._build_features(test)
         # Raw block (first len(raw) cols) keeps NaN for LGBM; engineered blocks
         # are already finite (cs/rolling produce 0 on degenerate input). Only
@@ -206,9 +242,27 @@ class Model:
         np.nan_to_num(X, copy=False, nan=np.nan, posinf=0.0, neginf=0.0)
 
         preds = np.zeros(X.shape[0], dtype=np.float64)
-        for booster in self.boosters:
-            preds += booster.predict(X)
-        preds /= len(self.boosters)
+        if self.backend in ("xgb_mt", "cat_mt"):
+            for clf, reg in zip(self.clf_boosters, self.reg_boosters):
+                pred_prob = clf.predict_proba(X)[:, 1]
+                pred_val = reg.predict(X)
+                preds += pred_prob * pred_val
+            preds /= len(self.reg_boosters)
+        else:
+            for booster in self.boosters:
+                preds += booster.predict(X)
+            preds /= len(self.boosters)
+
+        if self.neutralize_alpha > 0.0 and self._neutralize_src_idx.size > 0:
+            import sys
+            # Make sure we can import from src when running inside timeseries API
+            here = Path(__file__).resolve()
+            project_root = here.parent.parent
+            if str(project_root) not in sys.path:
+                sys.path.insert(0, str(project_root))
+            from src.neutralization import neutralize_predictions
+            neutral_features = Xraw_full[:, self._neutralize_src_idx]
+            preds = neutralize_predictions(preds, neutral_features, alpha=self.neutralize_alpha)
 
         clip = 3.0 * self.target_std
         preds = np.clip(preds, -clip, clip)
