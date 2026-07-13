@@ -150,10 +150,23 @@ def main():
         all_train = _partition_paths(args.data_root, "train")
         drift_train = all_train[-args.drift_train_parts:]
         test_paths = _partition_paths(args.drift_test_root, "test")
-        drift_rank = compute_drift_rank(
-            drift_train, test_paths, raw_feature_cols,
-            n_sample_train=args.drift_sample, seed=args.seed,
-        )
+        if test_paths:
+            drift_rank = compute_drift_rank(
+                drift_train, test_paths, raw_feature_cols,
+                n_sample_train=args.drift_sample, seed=args.seed,
+            )
+        else:
+            # Fallback: test parquets unavailable (e.g. train-only mount). Rank
+            # drift by the last train partition vs earlier ones — the temporal
+            # shift inside train is highly correlated with the train->test shift.
+            print("  test parquets not found; using train late-vs-early drift")
+            late = all_train[-1:]
+            early = all_train[:-1]
+            drift_rank = compute_drift_rank(
+                late, early, raw_feature_cols,
+                n_sample_train=args.drift_sample, n_sample_test=args.drift_sample,
+                seed=args.seed,
+            )
         raw_feature_cols = drop_drift_features(raw_feature_cols, drift_rank, args.drop_drift_k)
 
     # Sanitize rolling windows: drop non-positive values; empty means off.
