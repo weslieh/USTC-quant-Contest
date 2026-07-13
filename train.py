@@ -53,6 +53,15 @@ def parse_args():
     # CatBoost-specific hyperparameters (ignored when --backend is not cat)
     p.add_argument("--cat-depth", type=int, default=7)
     p.add_argument("--cat-l2-leaf-reg", type=float, default=3.0)
+    # Drift feature dropping (adversarial validation)
+    p.add_argument("--drop-drift-k", type=int, default=0,
+                   help="Drop top-K features by train-vs-test drift importance (0=off).")
+    p.add_argument("--drift-test-root", default="data",
+                   help="Data root to read test parquets for drift ranking (default: data).")
+    p.add_argument("--drift-sample", type=int, default=600_000,
+                   help="Max train rows sampled for drift ranking.")
+    p.add_argument("--drift-train-parts", type=int, default=3,
+                   help="Use last N train partitions for drift ranking (closest to test).")
     # IO
     p.add_argument("--out-dir", default="strategy")
     p.add_argument("--save-model", action="store_true")
@@ -131,6 +140,21 @@ def main():
 
     raw_feature_cols = get_feature_columns(frame)
     print(f"  raw feature columns: {len(raw_feature_cols)}")
+
+    # Optionally drop top-K drift features (adversarial validation: train vs test).
+    if args.drop_drift_k > 0:
+        from src.drift import compute_drift_rank, drop_drift_features
+        from src.dataset import _partition_paths
+        # Drift rank uses the LAST few train partitions (closest to test in time,
+        # so most representative of the shift) — not limited by --partitions.
+        all_train = _partition_paths(args.data_root, "train")
+        drift_train = all_train[-args.drift_train_parts:]
+        test_paths = _partition_paths(args.drift_test_root, "test")
+        drift_rank = compute_drift_rank(
+            drift_train, test_paths, raw_feature_cols,
+            n_sample_train=args.drift_sample, seed=args.seed,
+        )
+        raw_feature_cols = drop_drift_features(raw_feature_cols, drift_rank, args.drop_drift_k)
 
     # Sanitize rolling windows: drop non-positive values; empty means off.
     rolling_windows = [w for w in args.rolling_windows if w > 0]
