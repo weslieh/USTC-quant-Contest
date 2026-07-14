@@ -218,14 +218,11 @@ class Model:
             [self.raw_feature_columns.index(c) for c in self.rolling_source_columns
              if c in self.raw_feature_columns], dtype=np.intp
         )
-        self.target_std = float(
-            json.loads((self.subs[0].dir / "model_meta.json").read_text(encoding="utf-8"))
-            .get("target_std") or 1.0
-        )
+        s0_meta = json.loads((s0.dir / "model_meta.json").read_text(encoding="utf-8"))
+        self.target_std = float(s0_meta.get("target_std") or 1.0)
         # Target rank transform (shared spec from subs[0]).
         self.target_transform = s0_meta.get("target_transform", "none")
         self.target_quantile_lut = s0_meta.get("target_quantile_lut") or None
-        s0_meta = json.loads((s0.dir / "model_meta.json").read_text(encoding="utf-8"))
         self.neutralize_alpha = float(s0_meta.get("neutralize_alpha", 0.0))
         self.neutralize_features = s0_meta.get("neutralize_features", [])
         self._neutralize_src_idx = np.asarray(
