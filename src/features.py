@@ -100,14 +100,14 @@ def build_rolling_features(
         for w in windows:
             exprs.append(
                 pl.col(c)
-                .rolling_mean(window_size=w, min_periods=1)
+                .rolling_mean(window_size=w, min_samples=1)
                 .shift(1)
                 .over("asset_id")
                 .alias(f"{c}_rm_{w}")
             )
             exprs.append(
                 pl.col(c)
-                .rolling_std(window_size=w, min_periods=1)
+                .rolling_std(window_size=w, min_samples=1)
                 .shift(1)
                 .over("asset_id")
                 .alias(f"{c}_rs_{w}")

@@ -12,6 +12,7 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
+import pandas as pd
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -46,7 +47,7 @@ def test_cross_sectional_parity(with_nan):
 
     # Inference sees one time_id at a time; rebuild each slice with numpy.
     for t in range(40):
-        sl = df.filter(pl.col("time_id") == t)
+        sl = out.filter(pl.col("time_id") == t)
         raw = sl.select(src).to_numpy().astype(np.float32)
         got = np.zeros((len(sl), len(src) * 3), dtype=np.float32)
         for k in range(len(src)):
@@ -91,6 +92,9 @@ def test_rolling_parity():
     n_feat, n_assets, n_times, windows = 3, 6, 30, [5, 10]
     df = _make_panel(n_times=n_times, n_assets=n_assets, n_feat=n_feat, seed=2)
     src = ["feature_000", "feature_001", "feature_002"]
+    # build_rolling_features sorts by (asset_id, time_id); tag original row
+    # order so we can un-sort the output back to df's (time, asset) order.
+    df = df.with_row_index("_orig_idx")
     out = build_rolling_features(df, src, windows=tuple(windows))
     # build_rolling_features sorts by (asset_id, time_id); build expected names.
     roll_cols = []
@@ -117,7 +121,9 @@ def test_rolling_parity():
         for i in idxs:  # push after compute (current excluded)
             buf.push(int(aids[i]), raw_full[i])
 
-    exp = out.select(roll_cols).to_numpy().astype(np.float32)
+    # out is in (asset_id, time_id) order; un-sort to original row order via _orig_idx.
+    order = np.argsort(out["_orig_idx"].to_numpy())
+    exp = out.select(roll_cols).to_numpy()[order].astype(np.float32)
     # NaN->0 alignment: train Polars shift(1) yields null (->NaN via to_numpy)
     # for the first row per asset; inference yields 0.0. Replace NaN with 0.
     exp = np.nan_to_num(exp, nan=0.0, posinf=0.0, neginf=0.0)
@@ -146,3 +152,77 @@ def test_rolling_excludes_current_row():
     assert np.allclose(got, exp, atol=1e-4)
     # lag1 at t=3 == value at t=2 == 3.0 (current excluded)
     assert got[3, 0] == pytest.approx(3.0)
+
+
+# ---------------- interaction parity ----------------
+
+def test_interaction_parity():
+    """Pairwise mul/div interactions must match between the Polars training
+    helper (src.interactions) and the numpy inference mirror
+    (strategy.main._interaction_block), fed one time_id at a time."""
+    from src.interactions import make_pairs, build_interaction_features, interaction_column_names
+    from strategy.main import _interaction_block
+
+    rng = np.random.default_rng(7)
+    n_times, n_assets, n_feat = 12, 15, 5
+    rows = []
+    for t in range(n_times):
+        for a in range(n_assets):
+            row = {"time_id": t, "asset_id": a}
+            for f in range(n_feat):
+                v = rng.standard_normal()
+                if rng.random() < 0.05:
+                    v = np.nan
+                if rng.random() < 0.05:
+                    v = 0.0
+                row[f"feature_{f:03d}"] = float(v)
+            rows.append(row)
+    df = pl.DataFrame(rows)
+    raw_cols = [f"feature_{f:03d}" for f in range(n_feat)]
+    pairs = make_pairs(raw_cols[:4])  # 4 cols -> 6 pairs -> 12 interaction cols
+    col_names = interaction_column_names(pairs)
+    out, new_cols = build_interaction_features(df, pairs)
+    assert new_cols == col_names
+
+    # Inference builds features per time_id slice; interaction is within-row so
+    # we can verify the whole frame at once (slice-agnostic).
+    Xraw = df.select(raw_cols).to_numpy().astype(np.float32)
+    pair_idx = np.array([[raw_cols.index(a), raw_cols.index(b)] for a, b in pairs], dtype=np.intp)
+    got = _interaction_block(Xraw, pair_idx)
+    exp = out.select(col_names).to_numpy().astype(np.float32)
+    assert got.shape == exp.shape, (got.shape, exp.shape)
+    assert np.allclose(got, exp, atol=1e-5, equal_nan=False), \
+        f"interaction mismatch, max diff = {np.max(np.abs(got - exp))}"
+
+
+# ---------------- target rank transform parity ----------------
+
+def test_target_rank_transform():
+    """Per-time_id rank + global inverse-CDF LUT must round-trip, and the
+    numpy inference mirror (_inverse_cdf_map) must match the src helper."""
+    from src.target_transform import target_rank_per_time, build_inverse_cdf_lut, inverse_cdf_map
+    from strategy.main import _inverse_cdf_map
+
+    rng = np.random.default_rng(0)
+    time_ids = np.repeat(np.arange(5), 15).astype(np.int64)
+    target = rng.standard_normal(75).astype(np.float32)
+    target[0] = target[1]  # inject a tie
+
+    # rank per time_id == pandas groupby rank pct average
+    got = target_rank_per_time(time_ids, target)
+    exp = pd.Series(target).groupby(pd.Series(time_ids)).rank(
+        method="average", pct=True).to_numpy()
+    assert np.allclose(got, exp, atol=1e-6)
+    assert got.min() > 0 and got.max() <= 1.0
+
+    # LUT round-trips quantiles
+    y = rng.standard_normal(10000)
+    lut = build_inverse_cdf_lut(y, n_points=101)
+    qs = np.array([0.1, 0.25, 0.5, 0.75, 0.9])
+    mapped = inverse_cdf_map(qs, lut)
+    assert np.allclose(mapped, np.quantile(y, qs), atol=1e-3)
+
+    # inference mirror matches src
+    assert np.allclose(_inverse_cdf_map(qs, lut), mapped, atol=1e-5)
+
+

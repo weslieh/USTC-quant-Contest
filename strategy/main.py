@@ -10,6 +10,55 @@ import lightgbm as lgb
 EPS = 1e-8
 
 
+def _interaction_block(Xraw: np.ndarray, pair_idx: np.ndarray) -> np.ndarray:
+    """Inference mirror of src.interactions.build_interaction_features.
+
+    Self-contained (no src import) so it works in a stripped submission
+    package. Layout: [mul_0, div_0, mul_1, div_1, ...] in pair order.
+    Vectorized over pairs (no Python per-pair loop) to stay within the
+    per-step time budget across ~214k time_ids.
+    """
+    X = np.where(np.isfinite(Xraw), Xraw.astype(np.float64), 0.0)
+    a = X[:, pair_idx[:, 0]]  # (n, n_pairs)
+    b = X[:, pair_idx[:, 1]]  # (n, n_pairs)
+    mul = a * b
+    div = a / (b + EPS)
+    # interleave [mul_k, div_k] per pair -> (n, 2*n_pairs)
+    out = np.empty((X.shape[0], 2 * pair_idx.shape[0]), dtype=np.float32)
+    out[:, 0::2] = mul
+    out[:, 1::2] = div
+    return out
+
+
+def _neutralize_predictions(preds: np.ndarray, features: np.ndarray, alpha: float = 0.5) -> np.ndarray:
+    """Orthogonalize predictions against features (self-contained mirror of
+    src.neutralization.neutralize_predictions). Subtracts ``alpha`` of the
+    linear exposure of ``preds`` on ``features`` (with intercept).
+    """
+    n = preds.shape[0]
+    if n < 2 or alpha <= 0.0:
+        return preds
+    features_clean = np.where(np.isfinite(features), features, 0.0)
+    X = np.concatenate([features_clean, np.ones((n, 1))], axis=1)
+    try:
+        w, _, _, _ = np.linalg.lstsq(X, preds, rcond=None)
+        return preds - alpha * (X @ w)
+    except np.linalg.LinAlgError:
+        return preds
+
+
+def _inverse_cdf_map(rank_pred: np.ndarray, lut: dict) -> np.ndarray:
+    """Map predicted ranks in [0,1] back to target scale via the inverse-CDF
+    LUT stored in model_meta.json (self-contained mirror of
+    src.target_transform.inverse_cdf_map). Linear interpolation; clamped to
+    the LUT value range.
+    """
+    q = np.asarray(lut["q"], dtype=np.float64)
+    v = np.asarray(lut["v"], dtype=np.float64)
+    r = np.clip(np.asarray(rank_pred, dtype=np.float64), 0.0, 1.0)
+    return np.interp(r, q, v).astype(np.float64)
+
+
 def _cross_sectional(values: np.ndarray, eps: float = EPS) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Per-time_id rank fraction / zscore / demean, mirroring
     src.features.build_cross_sectional_features.
@@ -121,6 +170,9 @@ class Model:
         self.feature_columns = list(meta["feature_columns"])  # full ordered list
         self.target_std = float(meta.get("target_std") or 1.0)
         self.backend = meta.get("backend", "lgb")
+        # Target rank transform: map predicted rank -> target scale via LUT.
+        self.target_transform = meta.get("target_transform", "none")
+        self.target_quantile_lut = meta.get("target_quantile_lut") or None
 
         self.neutralize_alpha = meta.get("neutralize_alpha", 0.0)
         self.neutralize_features = meta.get("neutralize_features", [])
@@ -128,6 +180,15 @@ class Model:
             [self.raw_feature_columns.index(c) for c in self.neutralize_features
              if c in self.raw_feature_columns], dtype=np.intp
         )
+
+        # Interaction feature spec: list of [col_a, col_b] pairs (raw names).
+        self.interaction_pairs = [tuple(p) for p in meta.get("interaction_source_columns", [])]
+        self._inter_pair_idx = np.asarray(
+            [[self.raw_feature_columns.index(a), self.raw_feature_columns.index(b)]
+             for a, b in self.interaction_pairs
+             if a in self.raw_feature_columns and b in self.raw_feature_columns],
+            dtype=np.intp,
+        ).reshape(-1, 2)
 
         self.boosters = []
         if self.backend == "xgb_mt":
@@ -221,6 +282,10 @@ class Model:
                 self.rolling.push(int(asset_ids[i]), Xraw[i, self._roll_src_idx])
             feats.append(roll_block)
 
+        # Interactions: within-row pairwise mul/div (feature axis), no state.
+        if self._inter_pair_idx.size:
+            feats.append(_interaction_block(Xraw, self._inter_pair_idx))
+
         return np.concatenate(feats, axis=1)
 
     def predict(self, test: pd.DataFrame) -> np.ndarray:
@@ -254,15 +319,14 @@ class Model:
             preds /= len(self.boosters)
 
         if self.neutralize_alpha > 0.0 and self._neutralize_src_idx.size > 0:
-            import sys
-            # Make sure we can import from src when running inside timeseries API
-            here = Path(__file__).resolve()
-            project_root = here.parent.parent
-            if str(project_root) not in sys.path:
-                sys.path.insert(0, str(project_root))
-            from src.neutralization import neutralize_predictions
             neutral_features = Xraw_full[:, self._neutralize_src_idx]
-            preds = neutralize_predictions(preds, neutral_features, alpha=self.neutralize_alpha)
+            preds = _neutralize_predictions(preds, neutral_features, alpha=self.neutralize_alpha)
+
+        # Target rank transform: map predicted rank in [0,1] back to the
+        # original target scale via the stored inverse-CDF LUT, BEFORE clipping
+        # (the clip bound is in original scale).
+        if self.target_transform == "rank" and self.target_quantile_lut is not None:
+            preds = _inverse_cdf_map(preds, self.target_quantile_lut)
 
         clip = 3.0 * self.target_std
         preds = np.clip(preds, -clip, clip)

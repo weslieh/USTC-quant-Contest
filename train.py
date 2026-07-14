@@ -7,13 +7,15 @@ import lightgbm as lgb
 import numpy as np
 
 from src.dataset import load_train
-from src.cv import time_cv_split, adversarial_cv_split
+from src.cv import time_cv_split
 from src.features import (
     get_feature_columns,
     build_cross_sectional_features,
     build_rolling_features,
     fill_infinite,
 )
+from src.interactions import make_pairs, build_interaction_features, interaction_column_names
+from src.target_transform import target_rank_per_time, build_inverse_cdf_lut, inverse_cdf_map
 from src.model import build_model, weighted_r2_eval
 from src.metrics import weighted_zero_mean_r2
 
@@ -25,6 +27,8 @@ def parse_args():
     p.add_argument("--valid-frac", type=float, default=0.1)
     p.add_argument("--embargo", type=int, default=0, help="Time-id gap between train end and valid start.")
     p.add_argument("--adv-val-ratio", type=float, default=0.0, help="Use adversarial validation split instead of time CV. 0=off.")
+    p.add_argument("--av-reweight", action="store_true", help="Reweight train samples by AV odds-ratio (test-likeness) to correct drift. Train-only; inference unchanged.")
+    p.add_argument("--reweight-clip-quantile", type=float, default=0.99, help="Winsorize p_like_test at this quantile before odds-ratio (anti-explosion when AUC~1.0).")
     p.add_argument("--multi-task", action="store_true", help="Train dual models: target direction (classification) and target value (regression).")
     p.add_argument("--neutralize-alpha", type=float, default=0.0, help="Proportion of neutralization to apply during inference against drift features. 0=off.")
     p.add_argument("--neutralize-topk", type=int, default=10, help="Number of top drift features to neutralize against.")
@@ -32,6 +36,8 @@ def parse_args():
     p.add_argument("--cs-topk", type=int, default=25, help="Top-K raw features for cross-sectional derivs (0=off).")
     p.add_argument("--rolling-windows", type=int, nargs="*", default=[], help="Rolling windows (empty=off).")
     p.add_argument("--rolling-topk", type=int, default=20, help="Top-K raw features for rolling (0=all 323).")
+    p.add_argument("--interaction-topk", type=int, default=0, help="Top-K raw features for pairwise mul/div interactions (0=off). ~K*(K-1)/2 pairs * 2 cols.")
+    p.add_argument("--target-transform", choices=["none", "rank"], default="none", help="Transform the training target. 'rank' = per-time_id rank percentile; inverse-CDF LUT stored for inference.")
     p.add_argument("--importance-sample", type=int, default=1_000_000, help="Rows for pilot importance.")
     # Hyperparameters
     p.add_argument("--num-leaves", type=int, default=64)
@@ -84,18 +90,20 @@ def select_topk_by_importance(frame, raw_feature_cols, k, sample_rows, build_kwa
     return top
 
 
-def build_fold_features(train_df, valid_df, raw_cols, cs_source_cols, rolling_source_cols, rolling_windows):
-    """Attach cross-sectional + rolling features to a fold's train/valid.
+def build_fold_features(train_df, valid_df, raw_cols, cs_source_cols, rolling_source_cols, rolling_windows, interaction_pairs=None):
+    """Attach cross-sectional + rolling + interaction features to a fold's train/valid.
 
     Cross-sectional features are stateless per time_id. Rolling features are
     computed independently on train and valid (each fresh-starting) so the
     valid fold mimics inference, where the per-asset history buffer starts
-    empty — no train history leaks into valid rolling stats.
+    empty — no train history leaks into valid rolling stats. Interaction
+    features are within-row (feature axis), so they are identical on both.
     """
     new_cs_cols = []
     new_roll_cols = []
+    new_inter_cols = []
 
-    def _attach(df, cs_src, roll_src, wins):
+    def _attach(df, cs_src, roll_src, wins, inter_pairs):
         out = df
         cs_cols = []
         if cs_src:
@@ -108,12 +116,17 @@ def build_fold_features(train_df, valid_df, raw_cols, cs_source_cols, rolling_so
                 roll_cols.append(f"{s}_lag1")
                 for w in wins:
                     roll_cols += [f"{s}_rm_{w}", f"{s}_rs_{w}"]
-        return out, cs_cols, roll_cols
+        inter_cols = []
+        if inter_pairs:
+            out, inter_cols = build_interaction_features(out, inter_pairs)
+        return out, cs_cols, roll_cols, inter_cols
 
-    train_out, train_cs, train_roll = _attach(train_df, cs_source_cols, rolling_source_cols, rolling_windows)
-    valid_out, valid_cs, valid_roll = _attach(valid_df, cs_source_cols, rolling_source_cols, rolling_windows)
-    # cs/roll column name sets are identical across train/valid (same sources).
-    return train_out, valid_out, train_cs, train_roll
+    train_out, train_cs, train_roll, train_inter = _attach(
+        train_df, cs_source_cols, rolling_source_cols, rolling_windows, interaction_pairs)
+    valid_out, valid_cs, valid_roll, valid_inter = _attach(
+        valid_df, cs_source_cols, rolling_source_cols, rolling_windows, interaction_pairs)
+    # cs/roll/inter column name sets are identical across train/valid (same sources).
+    return train_out, valid_out, train_cs, train_roll, train_inter
 
 
 def main():
@@ -160,14 +173,20 @@ def main():
         random_state=args.seed,
     )
 
-    # Selective top-K source columns for cs / rolling (fixed across folds & inference).
+    # Selective top-K source columns for cs / rolling / interactions (fixed across folds & inference).
     cs_source_cols = []
     rolling_source_cols = []
-    need_selection = args.cs_topk > 0 or (rolling_windows and args.rolling_topk > 0)
+    interaction_pairs = []
+    need_selection = (
+        args.cs_topk > 0
+        or (rolling_windows and args.rolling_topk > 0)
+        or args.interaction_topk > 0
+    )
     if need_selection:
         all_top = select_topk_by_importance(
             frame, raw_feature_cols,
-            k=max(args.cs_topk, args.rolling_topk if args.rolling_topk > 0 else 0),
+            k=max(args.cs_topk, args.rolling_topk if args.rolling_topk > 0 else 0,
+                  args.interaction_topk),
             sample_rows=args.importance_sample, build_kwargs=build_kwargs,
         )
         if args.cs_topk > 0:
@@ -178,15 +197,43 @@ def main():
             print(f"  rolling source cols ({len(rolling_source_cols)}): {rolling_source_cols[:5]} ...")
         elif rolling_windows:
             rolling_source_cols = list(raw_feature_cols)
+        if args.interaction_topk > 0:
+            inter_src = all_top[:args.interaction_topk]
+            interaction_pairs = make_pairs(inter_src)
+            n_inter_cols = 2 * len(interaction_pairs)
+            print(
+                f"  interaction source cols ({len(inter_src)}): {inter_src[:5]} ... "
+                f"-> {len(interaction_pairs)} pairs, {n_inter_cols} new cols"
+            )
+
+    # Adversarial validation: either select test-like validation rows
+    # (--adv-val-ratio), or reweight train samples by test-likeness
+    # (--av-reweight), or both. Train the AV classifier once and reuse the
+    # per-time_id scores for both purposes.
+    use_av = args.adv_val_ratio > 0 or args.av_reweight
+    score_by_time = {}
+    if use_av:
+        from src.adversarial_cv import compute_score_by_time, build_folds_from_scores
+        print(f"\n  computing adversarial test-likeness (real test features) ...\n")
+        score_by_time, av_times, av_scores = compute_score_by_time(
+            frame, list(raw_feature_cols),
+            data_root=args.data_root,
+            sample_rows=args.importance_sample,
+            seed=args.seed,
+        )
 
     if args.adv_val_ratio > 0:
-        print(f"\n  running adversarial validation split (ratio={args.adv_val_ratio}) ...\n")
-        folds = adversarial_cv_split(
-            frame, list(raw_feature_cols),
+        print(f"  building AV validation folds (ratio={args.adv_val_ratio}) ...\n")
+        folds = build_folds_from_scores(
+            frame, av_times, av_scores,
             adv_val_ratio=args.adv_val_ratio,
-            sample_rows=args.importance_sample,
-            seed=args.seed
+            n_folds=args.n_folds,
+            embargo=args.embargo,
         )
+    elif args.av_reweight:
+        # Reweight only — keep the plain time CV folds.
+        folds = time_cv_split(frame, n_folds=args.n_folds, valid_frac=args.valid_frac, embargo=args.embargo)
+        print(f"\n  running {len(folds)}-fold expanding-window CV (AV reweight on) ...\n")
     else:
         folds = time_cv_split(frame, n_folds=args.n_folds, valid_frac=args.valid_frac, embargo=args.embargo)
         print(f"\n  running {len(folds)}-fold expanding-window CV ...\n")
@@ -204,6 +251,18 @@ def main():
     cv_dir.mkdir(parents=True, exist_ok=True)
     fold_boosters = []  # (fold_idx, (backend, booster_or_path), best_iter)
     target_std = None
+    target_lut = None  # inverse-CDF LUT for target-transform=rank (built fold 0)
+
+    def _score_valid(pred, y_valid_raw_, w_valid_):
+        """Compute weighted R² in the ORIGINAL target scale.
+
+        Under target-transform=rank the model predicts a rank in [0,1]; we
+        map it back via the LUT before scoring so CV tracks the public
+        leaderboard. For none/multi-task, pred is already in target scale.
+        """
+        if args.target_transform == "rank" and target_lut is not None:
+            pred = inverse_cdf_map(pred, target_lut)
+        return weighted_zero_mean_r2(y_valid_raw_, pred, w_valid_)
 
     for fold_idx, (train_lf, valid_lf) in enumerate(folds):
         if fold_idx < len(scores):
@@ -232,24 +291,57 @@ def main():
         print(f"  train time_ids: {len(train_times)}  valid time_ids: {len(valid_times)}")
         print(f"  train rows: {len(train_df)}  valid rows: {len(valid_df)}")
 
-        train_df, valid_df, cs_cols, roll_cols = build_fold_features(
+        train_df, valid_df, cs_cols, roll_cols, inter_cols = build_fold_features(
             train_df, valid_df, raw_feature_cols, cs_source_cols, rolling_source_cols, rolling_windows,
+            interaction_pairs=interaction_pairs,
         )
         # fill inf -> 0 on engineered cols; raw NaN left for LGBM native handling
-        if cs_cols or roll_cols:
-            train_df = fill_infinite(train_df, cs_cols + roll_cols)
-            valid_df = fill_infinite(valid_df, cs_cols + roll_cols)
+        engineered_cols = cs_cols + roll_cols + inter_cols
+        if engineered_cols:
+            train_df = fill_infinite(train_df, engineered_cols)
+            valid_df = fill_infinite(valid_df, engineered_cols)
 
-        all_feature_cols = list(raw_feature_cols) + cs_cols + roll_cols
+        all_feature_cols = list(raw_feature_cols) + cs_cols + roll_cols + inter_cols
         X_train = train_df.select(all_feature_cols).to_numpy().astype(np.float32)
         X_valid = valid_df.select(all_feature_cols).to_numpy().astype(np.float32)
-        y_train = train_df["target"].to_numpy().astype(np.float32)
-        y_valid = valid_df["target"].to_numpy().astype(np.float32)
+        y_train_raw = train_df["target"].to_numpy().astype(np.float32)
+        y_valid_raw = valid_df["target"].to_numpy().astype(np.float32)
+        y_train = y_train_raw
+        y_valid = y_valid_raw
         w_train = train_df["weight"].to_numpy().astype(np.float32)
         w_valid = valid_df["weight"].to_numpy().astype(np.float32)
 
+        # AV covariate-shift reweighting: multiply train weights by the
+        # odds-ratio of test-likeness (train-only; valid keeps original weights
+        # so CV still reports the public-leaderboard metric).
+        if args.av_reweight and score_by_time:
+            from src.reweight import time_id_to_weights
+            train_time_ids = train_df["time_id"].to_numpy()
+            rw = time_id_to_weights(
+                train_time_ids, score_by_time,
+                clip_quantile=args.reweight_clip_quantile,
+            )
+            w_train = w_train * rw
+            print(f"  [reweight] w_train mean={w_train.mean():.4f} "
+                  f"(odds-ratio clip q={args.reweight_clip_quantile})")
+
+        # target_std and the inverse-CDF LUT are in the ORIGINAL target scale
+        # (the clip bound and the inverse map must both be original-scale).
         if target_std is None:
-            target_std = float(np.std(y_train))
+            target_std = float(np.std(y_train_raw))
+            if args.target_transform == "rank":
+                target_lut = build_inverse_cdf_lut(y_train_raw, n_points=1001)
+                print(f"  [target-transform] rank mode; built inverse-CDF LUT "
+                      f"(target_std={target_std:.4f})")
+
+        # Transform the regression target to per-time_id rank percentile so the
+        # model learns a scale-invariant ordering. Inference maps the predicted
+        # rank back via the LUT; CV scores in original space (see _score_valid).
+        if args.target_transform == "rank":
+            y_train = target_rank_per_time(
+                train_df["time_id"].to_numpy(), y_train_raw)
+            y_valid = target_rank_per_time(
+                valid_df["time_id"].to_numpy(), y_valid_raw)
 
         if args.backend == "xgb":
             from src.model_xgb import build_xgb_model
@@ -306,7 +398,7 @@ def main():
                 pred = pred_prob * pred_val
                 del X_valid
 
-                score = weighted_zero_mean_r2(y_valid, pred, w_valid)
+                score = _score_valid(pred, y_valid_raw, w_valid)
                 print(f"  CV score: {score:.6f}  best_iter(reg): {best_iter}")
 
                 clf.save_model(str(cv_dir / f"fold_{fold_idx}_clf.json"))
@@ -386,7 +478,7 @@ def main():
                 pred = pred_prob * pred_val
                 del X_valid
 
-                score = weighted_zero_mean_r2(y_valid, pred, w_valid)
+                score = _score_valid(pred, y_valid_raw, w_valid)
                 print(f"  CV score: {score:.6f}  best_iter(reg): {best_iter}")
 
                 clf.save_model(str(cv_dir / f"fold_{fold_idx}_clf.cbm"))
@@ -480,7 +572,7 @@ def main():
                 booster_or_path.save_model(str(out_dir / fname))
             saved_fold_files.append(fname)
 
-        # Final feature column order = raw + cs + rolling (matches build_fold_features).
+        # Final feature column order = raw + cs + rolling + interaction (matches build_fold_features).
         cs_cols, roll_cols = [], []
         if cs_source_cols:
             cs_cols = []
@@ -492,7 +584,8 @@ def main():
                 roll_cols.append(f"{s}_lag1")
                 for w in rolling_windows:
                     roll_cols += [f"{s}_rm_{w}", f"{s}_rs_{w}"]
-        all_feature_cols = list(raw_feature_cols) + cs_cols + roll_cols
+        inter_cols = interaction_column_names(interaction_pairs) if interaction_pairs else []
+        all_feature_cols = list(raw_feature_cols) + cs_cols + roll_cols + inter_cols
 
         meta = {
             "backend": args.backend + ("_mt" if getattr(args, "multi_task", False) else ""),
@@ -503,8 +596,12 @@ def main():
             "rolling_source_columns": rolling_source_cols,
             "rolling_feature_columns": roll_cols,
             "rolling_windows": list(rolling_windows),
+            "interaction_source_columns": [list(p) for p in interaction_pairs] if interaction_pairs else [],
+            "interaction_feature_columns": inter_cols,
             "neutralize_alpha": getattr(args, "neutralize_alpha", 0.0),
             "neutralize_features": drift_features,
+            "target_transform": args.target_transform,
+            "target_quantile_lut": target_lut,
             "n_folds": len(fold_boosters),
             "fold_files": saved_fold_files,
             "target_std": target_std,
