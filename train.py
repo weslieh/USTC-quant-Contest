@@ -38,6 +38,7 @@ def parse_args():
     p.add_argument("--rolling-topk", type=int, default=20, help="Top-K raw features for rolling (0=all 323).")
     p.add_argument("--interaction-topk", type=int, default=0, help="Top-K raw features for pairwise mul/div interactions (0=off). ~K*(K-1)/2 pairs * 2 cols.")
     p.add_argument("--target-transform", choices=["none", "rank"], default="none", help="Transform the training target. 'rank' = per-time_id rank percentile; inverse-CDF LUT stored for inference.")
+    p.add_argument("--asset-as-categorical", action="store_true", help="Prepend asset_id as the first feature column. LightGBM treats it as categorical (optimal per-category splits); XGB/CatBoost treat it as a numeric column. Column order is identical across backends.")
     p.add_argument("--importance-sample", type=int, default=1_000_000, help="Rows for pilot importance.")
     # Hyperparameters
     p.add_argument("--num-leaves", type=int, default=64)
@@ -302,6 +303,12 @@ def main():
             valid_df = fill_infinite(valid_df, engineered_cols)
 
         all_feature_cols = list(raw_feature_cols) + cs_cols + roll_cols + inter_cols
+        # Optionally prepend asset_id as a feature column (index 0). LightGBM
+        # uses it as categorical; XGB/Cat treat it as numeric. Column order is
+        # identical across backends so the inference side can reproduce it.
+        asset_as_cat = bool(args.asset_as_categorical)
+        if asset_as_cat:
+            all_feature_cols = ["asset_id"] + all_feature_cols
         X_train = train_df.select(all_feature_cols).to_numpy().astype(np.float32)
         X_valid = valid_df.select(all_feature_cols).to_numpy().astype(np.float32)
         y_train_raw = train_df["target"].to_numpy().astype(np.float32)
@@ -517,6 +524,7 @@ def main():
             sample_weight=w_train,
             eval_set=[(X_valid, y_valid, w_valid)],
             eval_metric=weighted_r2_eval,
+            categorical_feature=[0] if asset_as_cat else None,
             callbacks=[lgb.early_stopping(args.early_stopping_rounds, verbose=False), lgb.log_evaluation(50)],
         )
         best_iter = model.best_iteration_
@@ -586,9 +594,12 @@ def main():
                     roll_cols += [f"{s}_rm_{w}", f"{s}_rs_{w}"]
         inter_cols = interaction_column_names(interaction_pairs) if interaction_pairs else []
         all_feature_cols = list(raw_feature_cols) + cs_cols + roll_cols + inter_cols
+        if asset_as_cat:
+            all_feature_cols = ["asset_id"] + all_feature_cols
 
         meta = {
             "backend": args.backend + ("_mt" if getattr(args, "multi_task", False) else ""),
+            "asset_as_categorical": asset_as_cat,
             "feature_columns": all_feature_cols,
             "raw_feature_columns": list(raw_feature_cols),
             "cs_source_columns": cs_source_cols,

@@ -173,6 +173,8 @@ class Model:
         # Target rank transform: map predicted rank -> target scale via LUT.
         self.target_transform = meta.get("target_transform", "none")
         self.target_quantile_lut = meta.get("target_quantile_lut") or None
+        # asset_id prepended as the first feature column (categorical for LGB).
+        self.asset_as_categorical = bool(meta.get("asset_as_categorical", False))
 
         self.neutralize_alpha = meta.get("neutralize_alpha", 0.0)
         self.neutralize_features = meta.get("neutralize_features", [])
@@ -259,6 +261,12 @@ class Model:
 
         n = Xraw.shape[0]
         feats = [Xraw]
+
+        # asset_id prepended as column 0 when trained with --asset-as-categorical.
+        # Matches train.py's all_feature_cols = ["asset_id"] + raw + engineered.
+        if self.asset_as_categorical:
+            asset_col = asset_ids.astype(np.float32).reshape(-1, 1)
+            feats = [asset_col, Xraw]
 
         # Cross-sectional: per time_id slice (the whole `test` is one time_id).
         if self._cs_src_idx.size:

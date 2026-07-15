@@ -237,6 +237,8 @@ class Model:
              if a in self.raw_feature_columns and b in self.raw_feature_columns],
             dtype=np.intp,
         ).reshape(-1, 2)
+        # asset_id prepended as first feature column (shared spec from subs[0]).
+        self.asset_as_categorical = bool(s0_meta.get("asset_as_categorical", False))
         self.rolling = _RollingBuf(len(self._roll_src_idx), self.rolling_windows)
         self.last_time_id: int | None = None
 
@@ -248,6 +250,10 @@ class Model:
         np.nan_to_num(Xraw, copy=False, nan=np.nan, posinf=np.nan, neginf=np.nan)
         n = Xraw.shape[0]
         feats = [Xraw]
+        # asset_id prepended as column 0 (matches train.py column order).
+        if self.asset_as_categorical:
+            asset_col = asset_ids.astype(np.float32).reshape(-1, 1)
+            feats = [asset_col, Xraw]
         if self._cs_src_idx.size:
             cs_block = np.zeros((n, self._cs_src_idx.size * 3), dtype=np.float32)
             for k, ci in enumerate(self._cs_src_idx):
