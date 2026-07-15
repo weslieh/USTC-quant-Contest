@@ -20,6 +20,9 @@ strategy/booster_fold_*.json
 strategy_lgb/
 strategy_xgb/
 strategy_cat/
+strategy_perasset/asset_*/
+strategy_perasset/model_meta.json
+strategy_perasset/cv/
 strategy_ensemble/ensemble_meta.json
 strategy_ensemble/booster_fold_*.txt
 strategy_ensemble/booster_fold_*.json
