@@ -18,7 +18,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import lightgbm as lgb
 
 
 class Model:
@@ -30,6 +29,8 @@ class Model:
 
         self.raw_feature_columns = list(meta["raw_feature_columns"])
         self.target_std = float(meta.get("target_std") or 1.0)
+        self.base_backend = meta.get("base_backend", "lgb")
+        self.fold_ext = meta.get("fold_ext", "txt")
 
         # asset_id -> list of fold boosters
         self.asset_models: dict[int, list] = {}
@@ -38,11 +39,28 @@ class Model:
             adir = here / spec["dir"]
             boosters = []
             for fold_idx in range(int(spec["n_folds"])):
-                boosters.append(lgb.Booster(model_file=str(adir / f"booster_fold_{fold_idx}.txt")))
+                fpath = adir / f"booster_fold_{fold_idx}.{self.fold_ext}"
+                boosters.append(self._load_booster(fpath))
             self.asset_models[aid] = boosters
 
         # Fallback: if an asset has no model (shouldn't happen), predict 0.
         self.last_time_id: int | None = None
+
+    def _load_booster(self, fpath: Path):
+        """Load one fold booster per backend (self-contained, no src import)."""
+        if self.base_backend == "xgb":
+            from xgboost import XGBRegressor
+            m = XGBRegressor()
+            m.load_model(str(fpath))
+            return m
+        elif self.base_backend == "cat":
+            from catboost import CatBoostRegressor
+            m = CatBoostRegressor()
+            m.load_model(str(fpath))
+            return m
+        else:
+            import lightgbm as lgb
+            return lgb.Booster(model_file=str(fpath))
 
     def predict(self, test: pd.DataFrame) -> np.ndarray:
         time_id = int(test["time_id"].iloc[0])

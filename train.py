@@ -132,12 +132,12 @@ def build_fold_features(train_df, valid_df, raw_cols, cs_source_cols, rolling_so
 
 
 def train_per_asset(args):
-    """Train one independent model per asset_id (LGB-only for now).
+    """Train one independent model per asset_id (LGB / XGB / Cat).
 
     Each of the 15 assets gets its own 5-fold expanding-window time CV with
     the same embargo/early-stopping as the global model. Boosters are saved
     per-asset under ``<out_dir>/asset_<id>/``; a top-level model_meta.json
-    records the shared feature spec and the asset directory list so the
+    records the shared feature spec, backend, and the asset directory list so the
     inference side can route rows by asset_id.
 
     Forces raw-only features: per-asset models already encode asset identity
@@ -147,6 +147,7 @@ def train_per_asset(args):
     from src.model import build_model, weighted_r2_eval
     from src.metrics import weighted_zero_mean_r2
 
+    backend = args.backend
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     meta_path = out_dir / "model_meta.json"
@@ -154,15 +155,36 @@ def train_per_asset(args):
     print("Loading data ...")
     frame = load_train(args.data_root, partitions=args.partitions)
     raw_feature_cols = get_feature_columns(frame)
-    print(f"  raw feature columns: {len(raw_feature_cols)}")
+    print(f"  raw feature columns: {len(raw_feature_cols)}  backend: {backend}")
 
-    build_kwargs = dict(
-        num_leaves=args.num_leaves, learning_rate=args.lr, n_estimators=args.n_est,
-        min_child_samples=args.min_child_samples, feature_fraction=args.feature_frac,
-        bagging_fraction=args.bagging_frac, bagging_freq=args.bagging_freq,
-        reg_alpha=args.reg_alpha, reg_lambda=args.reg_lambda,
-        random_state=args.seed,
-    )
+    # Backend-specific build kwargs (mirror the global path's defaults).
+    if backend == "lgb":
+        build_kwargs = dict(
+            num_leaves=args.num_leaves, learning_rate=args.lr, n_estimators=args.n_est,
+            min_child_samples=args.min_child_samples, feature_fraction=args.feature_frac,
+            bagging_fraction=args.bagging_frac, bagging_freq=args.bagging_freq,
+            reg_alpha=args.reg_alpha, reg_lambda=args.reg_lambda,
+            random_state=args.seed,
+        )
+        fold_ext = "txt"
+    elif backend == "xgb":
+        build_kwargs = dict(
+            n_estimators=args.n_est, learning_rate=args.lr,
+            max_depth=args.xgb_max_depth, min_child_weight=args.xgb_min_child_weight,
+            subsample=args.xgb_subsample, colsample_bytree=args.xgb_colsample,
+            reg_alpha=args.reg_alpha, reg_lambda=args.reg_lambda,
+            early_stopping_rounds=args.early_stopping_rounds, random_state=args.seed,
+        )
+        fold_ext = "json"
+    elif backend == "cat":
+        build_kwargs = dict(
+            iterations=args.n_est, learning_rate=args.lr,
+            depth=args.cat_depth, l2_leaf_reg=args.cat_l2_leaf_reg,
+            random_seed=args.seed, early_stopping_rounds=args.early_stopping_rounds,
+        )
+        fold_ext = "cbm"
+    else:
+        raise ValueError(f"per-asset unsupported backend: {backend}")
 
     asset_ids = sorted(frame.select("asset_id").unique().collect()["asset_id"].to_list())
     print(f"  assets: {asset_ids}  ({len(asset_ids)} models)")
@@ -198,24 +220,56 @@ def train_per_asset(args):
             if target_std is None:
                 target_std = float(np.std(y_train))
 
-            model = build_model(**build_kwargs)
-            model.fit(
-                X_train, y_train,
-                sample_weight=w_train,
-                eval_set=[(X_valid, y_valid, w_valid)],
-                eval_metric=weighted_r2_eval,
-                callbacks=[lgb.early_stopping(args.early_stopping_rounds, verbose=False), lgb.log_evaluation(100)],
-            )
-            best_iter = model.best_iteration_
-            del X_train
-            pred = model.predict(X_valid)
+            if backend == "lgb":
+                model = build_model(**build_kwargs)
+                model.fit(
+                    X_train, y_train,
+                    sample_weight=w_train,
+                    eval_set=[(X_valid, y_valid, w_valid)],
+                    eval_metric=weighted_r2_eval,
+                    callbacks=[lgb.early_stopping(args.early_stopping_rounds, verbose=False), lgb.log_evaluation(100)],
+                )
+                best_iter = model.best_iteration_
+                del X_train
+                pred = model.predict(X_valid)
+                del X_valid
+                booster = model.booster_
+            elif backend == "xgb":
+                from src.model_xgb import build_xgb_model
+                model = build_xgb_model(**build_kwargs)
+                model.fit(
+                    X_train, y_train,
+                    sample_weight=w_train,
+                    eval_set=[(X_valid, y_valid)],
+                    sample_weight_eval_set=[w_valid],
+                    verbose=False,
+                )
+                best_iter = getattr(model, "best_iteration", None)
+                del X_train
+                pred = model.predict(X_valid)
+                del X_valid
+                booster = model  # save_model on the estimator; reload via XGBRegressor
+            else:  # cat
+                from src.model_cat import build_cat_model
+                from catboost import Pool
+                model = build_cat_model(**build_kwargs)
+                train_pool = Pool(X_train, y_train, weight=w_train)
+                valid_pool = Pool(X_valid, y_valid, weight=w_valid)
+                model.fit(train_pool, eval_set=valid_pool)
+                best_iter = model.best_iteration_
+                del X_train
+                pred = model.predict(X_valid)
+                del X_valid
+                booster = model
+                del train_pool, valid_pool
+
             score = weighted_zero_mean_r2(y_valid, pred, w_valid)
             print(f"  CV score: {score:.6f}  best_iter: {best_iter}")
-            model.booster_.save_model(str(asset_cv / f"fold_{fold_idx}.txt"))
+            booster.save_model(str(asset_cv / f"fold_{fold_idx}.{fold_ext}"))
             asset_scores.append(float(score))
-            asset_boosters.append((fold_idx, model.booster_))
+            asset_boosters.append((fold_idx, booster))
             all_valid_preds.append((pred, y_valid, w_valid))
-            del train_df, valid_df, y_train, X_valid, model
+            del train_df, valid_df, y_train, y_valid, model
 
         mean_cv = float(np.mean(asset_scores)) if asset_scores else 0.0
         per_asset_scores[int(aid)] = asset_scores
@@ -223,7 +277,7 @@ def train_per_asset(args):
 
         # Save this asset's fold boosters.
         for fold_idx, booster in asset_boosters:
-            booster.save_model(str(asset_out / f"booster_fold_{fold_idx}.txt"))
+            booster.save_model(str(asset_out / f"booster_fold_{fold_idx}.{fold_ext}"))
         asset_dirs.append({"asset_id": int(aid), "dir": f"asset_{aid}",
                            "n_folds": len(asset_boosters), "cv_mean": mean_cv})
 
@@ -239,8 +293,10 @@ def train_per_asset(args):
     print(f"Overall OOF weighted R2: {overall:.6f}")
 
     meta = {
-        "backend": "lgb_perasset",
+        "backend": f"{backend}_perasset",
         "per_asset": True,
+        "base_backend": backend,
+        "fold_ext": fold_ext,
         "feature_columns": list(raw_feature_cols),
         "raw_feature_columns": list(raw_feature_cols),
         "n_assets": len(asset_ids),
