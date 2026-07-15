@@ -39,6 +39,7 @@ def parse_args():
     p.add_argument("--interaction-topk", type=int, default=0, help="Top-K raw features for pairwise mul/div interactions (0=off). ~K*(K-1)/2 pairs * 2 cols.")
     p.add_argument("--target-transform", choices=["none", "rank"], default="none", help="Transform the training target. 'rank' = per-time_id rank percentile; inverse-CDF LUT stored for inference.")
     p.add_argument("--asset-as-categorical", action="store_true", help="Prepend asset_id as the first feature column. LightGBM treats it as categorical (optimal per-category splits); XGB/CatBoost treat it as a numeric column. Column order is identical across backends.")
+    p.add_argument("--per-asset", action="store_true", help="Train one independent model per asset_id (15 models, each 5-fold). Inference routes by asset_id. Forces raw-only features (no asset_id column / cs / rolling / interactions).")
     p.add_argument("--importance-sample", type=int, default=1_000_000, help="Rows for pilot importance.")
     # Hyperparameters
     p.add_argument("--num-leaves", type=int, default=64)
@@ -130,8 +131,135 @@ def build_fold_features(train_df, valid_df, raw_cols, cs_source_cols, rolling_so
     return train_out, valid_out, train_cs, train_roll, train_inter
 
 
+def train_per_asset(args):
+    """Train one independent model per asset_id (LGB-only for now).
+
+    Each of the 15 assets gets its own 5-fold expanding-window time CV with
+    the same embargo/early-stopping as the global model. Boosters are saved
+    per-asset under ``<out_dir>/asset_<id>/``; a top-level model_meta.json
+    records the shared feature spec and the asset directory list so the
+    inference side can route rows by asset_id.
+
+    Forces raw-only features: per-asset models already encode asset identity
+    by construction, so asset_id column / cs / rolling / interactions are off.
+    """
+    from src.cv import time_cv_split
+    from src.model import build_model, weighted_r2_eval
+    from src.metrics import weighted_zero_mean_r2
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    meta_path = out_dir / "model_meta.json"
+
+    print("Loading data ...")
+    frame = load_train(args.data_root, partitions=args.partitions)
+    raw_feature_cols = get_feature_columns(frame)
+    print(f"  raw feature columns: {len(raw_feature_cols)}")
+
+    build_kwargs = dict(
+        num_leaves=args.num_leaves, learning_rate=args.lr, n_estimators=args.n_est,
+        min_child_samples=args.min_child_samples, feature_fraction=args.feature_frac,
+        bagging_fraction=args.bagging_frac, bagging_freq=args.bagging_freq,
+        reg_alpha=args.reg_alpha, reg_lambda=args.reg_lambda,
+        random_state=args.seed,
+    )
+
+    asset_ids = sorted(frame.select("asset_id").unique().collect()["asset_id"].to_list())
+    print(f"  assets: {asset_ids}  ({len(asset_ids)} models)")
+
+    target_std = None
+    asset_dirs = []
+    per_asset_scores = {}
+    all_valid_preds = []  # (rows, pred, y, w) for overall weighted score
+
+    for aid in asset_ids:
+        print(f"\n{'=' * 50}\n=== asset_id {aid} ===")
+        asset_frame = frame.filter(pl.col("asset_id") == aid)
+        folds = time_cv_split(
+            asset_frame, n_folds=args.n_folds, valid_frac=args.valid_frac, embargo=args.embargo,
+        )
+        asset_out = out_dir / f"asset_{aid}"
+        asset_cv = asset_out / "cv"
+        asset_cv.mkdir(parents=True, exist_ok=True)
+        asset_scores = []
+        asset_boosters = []
+
+        for fold_idx, (train_lf, valid_lf) in enumerate(folds):
+            print(f"  --- Fold {fold_idx + 1} / {len(folds)} ---")
+            train_df = train_lf.collect()
+            valid_df = valid_lf.collect()
+            X_train = train_df.select(raw_feature_cols).to_numpy().astype(np.float32)
+            X_valid = valid_df.select(raw_feature_cols).to_numpy().astype(np.float32)
+            y_train = train_df["target"].to_numpy().astype(np.float32)
+            y_valid = valid_df["target"].to_numpy().astype(np.float32)
+            w_train = train_df["weight"].to_numpy().astype(np.float32)
+            w_valid = valid_df["weight"].to_numpy().astype(np.float32)
+
+            if target_std is None:
+                target_std = float(np.std(y_train))
+
+            model = build_model(**build_kwargs)
+            model.fit(
+                X_train, y_train,
+                sample_weight=w_train,
+                eval_set=[(X_valid, y_valid, w_valid)],
+                eval_metric=weighted_r2_eval,
+                callbacks=[lgb.early_stopping(args.early_stopping_rounds, verbose=False), lgb.log_evaluation(100)],
+            )
+            best_iter = model.best_iteration_
+            del X_train
+            pred = model.predict(X_valid)
+            score = weighted_zero_mean_r2(y_valid, pred, w_valid)
+            print(f"  CV score: {score:.6f}  best_iter: {best_iter}")
+            model.booster_.save_model(str(asset_cv / f"fold_{fold_idx}.txt"))
+            asset_scores.append(float(score))
+            asset_boosters.append((fold_idx, model.booster_))
+            all_valid_preds.append((pred, y_valid, w_valid))
+            del train_df, valid_df, y_train, X_valid, model
+
+        mean_cv = float(np.mean(asset_scores)) if asset_scores else 0.0
+        per_asset_scores[int(aid)] = asset_scores
+        print(f"  asset {aid} mean CV: {mean_cv:.6f}")
+
+        # Save this asset's fold boosters.
+        for fold_idx, booster in asset_boosters:
+            booster.save_model(str(asset_out / f"booster_fold_{fold_idx}.txt"))
+        asset_dirs.append({"asset_id": int(aid), "dir": f"asset_{aid}",
+                           "n_folds": len(asset_boosters), "cv_mean": mean_cv})
+
+    # Overall weighted R² across all assets' OOF valid predictions.
+    overall = 0.0
+    if all_valid_preds:
+        all_pred = np.concatenate([p for p, _, _ in all_valid_preds])
+        all_y = np.concatenate([y for _, y, _ in all_valid_preds])
+        all_w = np.concatenate([w for _, _, w in all_valid_preds])
+        overall = float(weighted_zero_mean_r2(all_y, all_pred, all_w))
+    print(f"\n{'=' * 50}")
+    print(f"Per-asset CV means: {[round(float(np.mean(per_asset_scores[a])), 6) for a in sorted(per_asset_scores)]}")
+    print(f"Overall OOF weighted R2: {overall:.6f}")
+
+    meta = {
+        "backend": "lgb_perasset",
+        "per_asset": True,
+        "feature_columns": list(raw_feature_cols),
+        "raw_feature_columns": list(raw_feature_cols),
+        "n_assets": len(asset_ids),
+        "asset_dirs": asset_dirs,
+        "n_folds": args.n_folds,
+        "target_std": target_std,
+        "cv_mean": overall,
+        "per_asset_cv": {str(a): s for a, s in per_asset_scores.items()},
+        "hparams": build_kwargs,
+    }
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    print(f"Saved per-asset meta -> {meta_path}")
+
+
 def main():
     args = parse_args()
+
+    if getattr(args, "per_asset", False):
+        return train_per_asset(args)
 
     out_dir = Path(args.out_dir)
     cv_dir = out_dir / "cv"
