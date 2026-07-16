@@ -49,8 +49,16 @@ class _PerAssetSub:
     def __init__(self, model_dir: Path, weight: float):
         self.weight = weight
         meta = json.loads((model_dir / "model_meta.json").read_text(encoding="utf-8"))
-        self.base_backend = meta.get("base_backend", "lgb")
-        self.fold_ext = meta.get("fold_ext", "txt")
+        # base_backend / fold_ext: prefer explicit fields, else infer from the
+        # ``backend`` tag (e.g. "lgb_perasset"). Older LGB per-asset metas had
+        # base_backend=None / fold_ext=None, so guard against that.
+        be = meta.get("base_backend")
+        if not be:
+            tag = meta.get("backend", "lgb_perasset")
+            be = tag.split("_perasset")[0] if "_perasset" in tag else "lgb"
+        self.base_backend = be
+        ext_map = {"lgb": "txt", "xgb": "json", "cat": "cbm"}
+        self.fold_ext = meta.get("fold_ext") or ext_map.get(self.base_backend, "txt")
         self.asset_models: dict[int, list] = {}
         for spec in meta.get("asset_dirs", []):
             aid = int(spec["asset_id"])
