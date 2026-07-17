@@ -6,7 +6,7 @@
 # platforms). Object-storage sync is optional and pluggable through env vars
 # in scripts/train-entrypoint.sh, so the image stays lean and provider-agnostic.
 
-FROM python:3.12-slim
+FROM pytorch/pytorch:2.10.0-cuda12.6-cudnn9-runtime
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -19,7 +19,8 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /workspace
 
 # libgomp1: OpenMP runtime required by LightGBM's bundled .so (absent in -slim).
-RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
+RUN rm -f /usr/lib/python*/EXTERNALLY-MANAGED \
+    && apt-get update && apt-get install -y --no-install-recommends libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Install dependencies first (cached layer; code changes won't bust it).
