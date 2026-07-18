@@ -71,7 +71,12 @@ class Model:
             m = _DAEMLP(n_features=n_features, n_assets=n_assets,
                         asset_emb_dim=asset_emb_dim, hidden=hidden,
                         bottleneck=bottleneck)
-            state = torch.load(here / fname, map_location=self.device, weights_only=True)
+            # weights_only=True (torch>=2.4) avoids arbitrary pickle execution;
+            # fall back to plain load on older torch where the kwarg is absent.
+            try:
+                state = torch.load(here / fname, map_location=self.device, weights_only=True)
+            except TypeError:
+                state = torch.load(here / fname, map_location=self.device)
             m.load_state_dict(state)
             m.eval()
             self.models.append(m)
