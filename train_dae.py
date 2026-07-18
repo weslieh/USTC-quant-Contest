@@ -121,6 +121,9 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     meta_path = out_dir / "model_meta.json"
+    cv_dir = out_dir / "cv"
+    cv_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cv_dir / "scores.json"
 
     print("Loading data ...")
     frame = load_train(args.data_root, partitions=args.partitions)
@@ -136,7 +139,32 @@ def main():
     scores = []
     target_std = None
 
+    # Resume support: if a cached scores.json exists and --fresh is off, skip
+    # folds whose booster .pt is already on disk. Survives OOM crashes mid-run
+    # (just re-run the same command on a bigger machine).
+    cached = {}
+    if (not args.fresh) and cache_path.exists():
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            print(f"  resume: {len(cached.get('scores', []))} fold(s) already done")
+        except Exception as exc:
+            print(f"  could not parse {cache_path}: {exc}; starting fresh")
+            cached = {}
+    if args.fresh:
+        cached = {}
+    if "target_std" in cached:
+        target_std = cached["target_std"]
+    done_scores = list(cached.get("scores", []))
+
     for fold_idx, (train_lf, valid_lf) in enumerate(folds):
+        fname = f"booster_fold_{fold_idx}.pt"
+        # Skip if this fold was completed and its weights are on disk.
+        if fold_idx < len(done_scores) and (out_dir / fname).exists():
+            print(f"\n--- Fold {fold_idx + 1} / {len(folds)} (cached, score={done_scores[fold_idx]:.6f}) ---")
+            fold_files.append(fname)
+            scores.append(float(done_scores[fold_idx]))
+            continue
+
         print(f"\n--- Fold {fold_idx + 1} / {len(folds)} ---")
         train_df = train_lf.collect()
         valid_df = valid_lf.collect()
@@ -217,12 +245,13 @@ def main():
                 print(f"  early stop at epoch {epoch}, best {best_score:.6f}@{best_epoch}")
                 break
 
-        # Save best model for this fold.
+        # Save best model for this fold + incrementally update the resume cache.
         fname = f"booster_fold_{fold_idx}.pt"
         torch.save(best_state, out_dir / fname)
         fold_files.append(fname)
         scores.append(float(best_score))
         print(f"  fold {fold_idx} best valid R2: {best_score:.6f} -> {fname}")
+        cache_path.write_text(json.dumps({"scores": scores, "target_std": target_std}, indent=2), encoding="utf-8")
         del Xtr_t, aidtr_t, ytr_t, wtr_t, Xva_t, aidva_t, yva_t, wva_t, model, best_state
         if device.type == "cuda":
             torch.cuda.empty_cache()
