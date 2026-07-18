@@ -224,7 +224,7 @@ def main():
                 loss = args.recon_weight * l_recon + args.target_weight * l_tgt
                 loss.backward()
                 opt.step()
-                tot_recon += float(l_recon); tot_tgt += float(l_tgt)
+                tot_recon += float(l_recon.detach()); tot_tgt += float(l_tgt.detach())
             # eval
             model.eval()
             with torch.no_grad():
