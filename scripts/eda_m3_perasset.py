@@ -98,7 +98,10 @@ def per_asset_importance(lf, feature_cols, per_asset_rows=150_000, seeds=(0, 1))
     asset_ids = sorted(lf.select(pl.col("asset_id").unique()).collect().to_numpy().ravel().tolist())
     gain = np.zeros((len(asset_ids), len(feature_cols)), dtype=np.float64)
     for ai, aid in enumerate(asset_ids):
-        sub = lf.filter(pl.col("asset_id") == aid)
+        # Select only needed cols before the per-asset collect (memory: full mode
+        # collects ~880k rows x 325 cols per asset; selecting first bounds it).
+        sub = lf.filter(pl.col("asset_id") == aid).select(
+            ["time_id"] + feature_cols + ["target", "weight"])
         # sample within the asset
         df = ec.sample_by_time(sub, per_asset_rows, n_assets=1, seed=42)
         if df.height < 2000:
@@ -154,7 +157,10 @@ def main():
     ec.save_csv(overview, out / "m3_asset_overview.csv")
 
     # ---- 2. 15x15 asset target correlation ----
-    sample = ec.sample_by_time(lf, args.sample_rows, seed=args.seed)
+    # Pivot only needs time_id/asset_id/target; select before collect so full
+    # mode (--sample-rows 0) doesn't materialize 375 cols x 13.2M rows.
+    sample = ec.sample_by_time(
+        lf.select(["time_id", "asset_id", "target"]), args.sample_rows, seed=args.seed)
     print(f"sample rows for asset corr: {sample.height}", flush=True)
     atc, asset_cols = asset_target_corr_matrix(sample)
     ec.save_corr_heatmap(atc, [f"a{c}" for c in asset_cols],

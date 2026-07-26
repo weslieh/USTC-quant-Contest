@@ -185,8 +185,11 @@ def main():
     # ---- 1. 47x47 responder correlation ----
     # 47x47 corr only needs ~500k rows (Pearson SE ~0.0014); cap to keep memory
     # low. The covariance-consistency verdict uses --seg-rows separately below.
+    # Select only needed cols before collect so full mode (--sample-rows 0) also
+    # stays cheap (50 cols, not 375).
     corr_rows = min(args.sample_rows, 500_000) if args.sample_rows > 0 else 0
-    sample = ec.sample_by_time(lf, corr_rows, seed=args.seed)
+    lf_resp = lf.select(["time_id"] + responder_cols + ["target", "weight"])
+    sample = ec.sample_by_time(lf_resp, corr_rows, seed=args.seed)
     print(f"sample rows for corr/PCA: {sample.height} (capped at 500k)", flush=True)
     sample_clean = ec.drop_any_nan_rows(sample, responder_cols)
     print(f"after NaN drop: {sample_clean.height}", flush=True)
