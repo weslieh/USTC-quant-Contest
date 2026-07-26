@@ -132,7 +132,7 @@ def main():
 - See m1_feature_corr_heatmap.png, m1_feature_dendrogram.png, m1_feature_clusters.csv.
 
 ## Distribution shape -> physical-type guess
-{cat_counts.to_pandas().to_markdown(index=False)}
+{ec.md_table(cat_counts)}
 
 - heavy_tailed_return_like (kurt>6): likely return/ratio features.
 - right_skew_vol_like (skew>1): likely volatility/size features.
@@ -143,7 +143,7 @@ def main():
 - Top 20 features carry **{top20_share:.1%}** of total |corr with target|.
 - {"Signal concentrated: restrict interaction/discovery to top ~20, not top-100." if top20_share > 0.4 else "Signal diffuse: many weak features."}
 - Top 10:
-{top10.to_pandas().to_markdown(index=False)}
+{ec.md_table(top10)}
 
 ## Cross-module use
 - Feed the feature clusters + physical-type categories into Module 3's per-asset

@@ -316,13 +316,13 @@ def main():
 - 47x47 responder correlation computed on {corr_n:,} rows.
 - Responder PCA: top-5 PCs explain **{top5_cum:.1%}** of variance; need **{need20_pc}** PCs for 80%.
 - Horizon-group validation: in-group mean|corr| / overall mean|corr| ratios (>>1 means grouping real):
-{hg_df.to_pandas().to_markdown(index=False) if hasattr(hg_df,'to_pandas') else hg_df}
+{ec.md_table(hg_df)}
 - Max |weighted corr(responder, target)| = **{max_abs_target:.4f}**
 - Top 8 responder-target weighted correlations:
-{rc_df.head(8).to_pandas().to_markdown(index=False) if hasattr(rc_df,'to_pandas') else rc_df.head(8)}
+{ec.md_table(rc_df, max_rows=8)}
 
 ## Covariance stability across early/mid/late (the core verdict metric)
-{cons_df.to_pandas().to_markdown(index=False) if hasattr(cons_df,'to_pandas') else cons_df}
+{ec.md_table(cons_df)}
 
 - procrustes_* = mean subspace similarity of top-5 PC loadings (1.0 = identical). **PRIMARY gate** — robust.
 - fro_* = relative Frobenius distance (0 = identical, large = drifted). **PRIMARY gate**.

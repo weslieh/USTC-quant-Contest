@@ -318,6 +318,39 @@ def save_summary(module_name, md_text, path):
     print(f"  wrote {path}", flush=True)
 
 
+def md_table(df, max_rows=None):
+    """Render a polars/numpy frame as a GitHub-markdown table without depending
+    on pandas/tabulate (cloud envs often lack tabulate). Falls back to a plain
+    string if rendering fails.
+    """
+    try:
+        if isinstance(df, np.ndarray):
+            df = pl.DataFrame(df)
+        if max_rows is not None and hasattr(df, "head"):
+            df = df.head(max_rows)
+        if not hasattr(df, "columns"):
+            return str(df)
+        cols = list(df.columns)
+        # polars DataFrame -> list of rows
+        rows = df.rows()
+        header = "| " + " | ".join(cols) + " |"
+        sep = "| " + " | ".join(["---"] * len(cols)) + " |"
+        lines = [header, sep]
+        for r in rows:
+            cells = []
+            for v in r:
+                if v is None:
+                    cells.append("")
+                elif isinstance(v, float):
+                    cells.append(f"{v:.6g}")
+                else:
+                    cells.append(str(v))
+            lines.append("| " + " | ".join(cells) + " |")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"(table render failed: {e})\n{df}"
+
+
 def list_outputs(out_dir):
     """Print the produced files (helps pack up results on a cloud box)."""
     p = Path(out_dir)

@@ -211,7 +211,7 @@ def main():
     md = f"""# EDA Module 3 — Per-asset differences
 
 ## Per-asset overview (sorted by wyy_share = share of R^2 zero-prediction denominator)
-{overview_sorted.to_pandas().to_markdown(index=False)}
+{ec.md_table(overview_sorted)}
 
 ## 15x15 same-time_id target correlation
 - Reveals which assets co-move (shared generating process).
