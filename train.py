@@ -42,6 +42,9 @@ def parse_args():
     p.add_argument("--interaction-topk", type=int, default=0, help="Top-K raw features for pairwise mul/div interactions (0=off). ~K*(K-1)/2 pairs * 2 cols.")
     p.add_argument("--per-asset-topk", type=int, default=0, help="Per-asset masked feature columns (0=off). For each asset, take its top-K raw features (by precomputed importance) and add a column holding that feature's value on that asset's rows and 0 elsewhere. K=5 -> 15*K=75 extra cols. Within-row, drift-safe like interactions.")
     p.add_argument("--per-asset-importance-csv", type=str, default="out/eda_full/m3_per_asset_importance.csv", help="CSV with per-asset feature importance (cols: asset_id, feature_*.). Used to pick each asset's top-K for --per-asset-topk.")
+    p.add_argument("--per-asset-skip-universal", action="store_true", help="When picking per-asset top-K, skip 'universal' features (those in the top-universal_topk of >= universal_min_assets assets) to avoid redundancy with raw. Fills the slot from below so each asset still gets K asset-specific features.")
+    p.add_argument("--per-asset-universal-topk", type=int, default=20, help="Window size for defining universal features (a feature is universal if in its top-this-many of enough assets).")
+    p.add_argument("--per-asset-universal-min-assets", type=int, default=12, help="Min number of assets a feature must appear in (within top-universal_topk) to be skipped as universal.")
     p.add_argument("--target-transform", choices=["none", "rank"], default="none", help="Transform the training target. 'rank' = per-time_id rank percentile; inverse-CDF LUT stored for inference.")
     p.add_argument("--asset-as-categorical", action="store_true", help="Prepend asset_id as the first feature column. LightGBM treats it as categorical (optimal per-category splits); XGB/CatBoost treat it as a numeric column. Column order is identical across backends.")
     p.add_argument("--importance-sample", type=int, default=1_000_000, help="Rows for pilot importance.")
@@ -96,7 +99,7 @@ def select_topk_by_importance(frame, raw_feature_cols, k, sample_rows, build_kwa
     return top
 
 
-def load_per_asset_specs(csv_path, raw_feature_cols, k):
+def load_per_asset_specs(csv_path, raw_feature_cols, k, universal_topk=0, universal_min_assets=12):
     """Read per-asset feature importance CSV and return ``[(asset_id, feature_name), ...]``.
 
     The CSV (produced by scripts/eda_m3_perasset.py) has an ``asset_id`` column
@@ -104,11 +107,20 @@ def load_per_asset_specs(csv_path, raw_feature_cols, k):
     features by gain (restricted to ``raw_feature_cols``) become a spec pair.
     Returns a flat list of (asset_id, feature_name) in asset-then-rank order,
     which is the column order of the per-asset block.
+
+    If ``universal_topk > 0``: a feature is "universal" if it appears in the
+    top-``universal_topk`` of at least ``universal_min_assets`` assets. Universal
+    features are skipped when picking each asset's top-K (the slot is filled from
+    below), so the per-asset columns carry asset-specific signal rather than
+    duplicating what raw already covers (e.g. feature_230 is strong everywhere ->
+    redundant as a masked column). Set universal_topk=0 to disable (original
+    behavior).
     """
     import csv as _csv
-    feats = [c for c in raw_feature_cols]
-    feat_set = set(feats)
-    specs = []
+    feat_set = set(raw_feature_cols)
+    # First pass: read all rows, compute per-asset top lists, and the universal set.
+    rows = []
+    universal = set()
     with open(csv_path, newline="") as fh:
         reader = _csv.DictReader(fh)
         for row in reader:
@@ -119,8 +131,26 @@ def load_per_asset_specs(csv_path, raw_feature_cols, k):
             scored = [(c, float(row[c])) for c in row
                       if c in feat_set and row[c] not in (None, "")]
             scored.sort(key=lambda kv: kv[1], reverse=True)
-            for fname, _g in scored[:k]:
-                specs.append((aid, fname))
+            rows.append((aid, scored))
+    if universal_topk > 0 and rows:
+        from collections import Counter
+        appear = Counter()
+        for _aid, scored in rows:
+            for fname, _g in scored[:universal_topk]:
+                appear[fname] += 1
+        universal = {f for f, c in appear.items() if c >= universal_min_assets}
+        print(f"  per-asset universal skip: {sorted(universal)} "
+              f"(in top-{universal_topk} of >={universal_min_assets} assets)")
+    specs = []
+    for aid, scored in rows:
+        picked = 0
+        for fname, _g in scored:
+            if fname in universal:
+                continue
+            specs.append((aid, fname))
+            picked += 1
+            if picked >= k:
+                break
     return specs
 
 
@@ -283,9 +313,13 @@ def main():
     per_asset_specs = []
     if args.per_asset_topk > 0:
         per_asset_specs = load_per_asset_specs(
-            args.per_asset_importance_csv, raw_feature_cols, args.per_asset_topk)
+            args.per_asset_importance_csv, raw_feature_cols, args.per_asset_topk,
+            universal_topk=args.per_asset_universal_topk if args.per_asset_skip_universal else 0,
+            universal_min_assets=args.per_asset_universal_min_assets,
+        )
         print(f"  per-asset topk={args.per_asset_topk}: {len(per_asset_specs)} specs "
-              f"({len(per_asset_specs)} extra cols) from {args.per_asset_importance_csv}")
+              f"({len(per_asset_specs)} extra cols) from {args.per_asset_importance_csv}"
+              f"{' [skip-universal]' if args.per_asset_skip_universal else ''}")
         if not per_asset_specs:
             print("  WARNING: no per-asset specs loaded; --per-asset-topk has no effect.")
     if (not args.fresh) and scores_path.exists():
@@ -662,6 +696,7 @@ def main():
             "per_asset_specs": [[a, f] for a, f in per_asset_specs],
             "per_asset_feature_columns": pa_cols,
             "per_asset_importance_source": args.per_asset_importance_csv if per_asset_specs else None,
+            "per_asset_skip_universal": bool(args.per_asset_skip_universal),
             "neutralize_alpha": getattr(args, "neutralize_alpha", 0.0),
             "neutralize_features": drift_features,
             "target_transform": args.target_transform,
