@@ -14,7 +14,10 @@ from src.features import (
     build_rolling_features,
     fill_infinite,
 )
-from src.interactions import make_pairs, build_interaction_features, interaction_column_names
+from src.interactions import (
+    make_pairs, build_interaction_features, interaction_column_names,
+    build_per_asset_features, per_asset_column_names,
+)
 from src.target_transform import target_rank_per_time, build_inverse_cdf_lut, inverse_cdf_map
 from src.model import build_model, weighted_r2_eval
 from src.metrics import weighted_zero_mean_r2
@@ -37,6 +40,8 @@ def parse_args():
     p.add_argument("--rolling-windows", type=int, nargs="*", default=[], help="Rolling windows (empty=off).")
     p.add_argument("--rolling-topk", type=int, default=20, help="Top-K raw features for rolling (0=all 323).")
     p.add_argument("--interaction-topk", type=int, default=0, help="Top-K raw features for pairwise mul/div interactions (0=off). ~K*(K-1)/2 pairs * 2 cols.")
+    p.add_argument("--per-asset-topk", type=int, default=0, help="Per-asset masked feature columns (0=off). For each asset, take its top-K raw features (by precomputed importance) and add a column holding that feature's value on that asset's rows and 0 elsewhere. K=5 -> 15*K=75 extra cols. Within-row, drift-safe like interactions.")
+    p.add_argument("--per-asset-importance-csv", type=str, default="out/eda_full/m3_per_asset_importance.csv", help="CSV with per-asset feature importance (cols: asset_id, feature_*.). Used to pick each asset's top-K for --per-asset-topk.")
     p.add_argument("--target-transform", choices=["none", "rank"], default="none", help="Transform the training target. 'rank' = per-time_id rank percentile; inverse-CDF LUT stored for inference.")
     p.add_argument("--asset-as-categorical", action="store_true", help="Prepend asset_id as the first feature column. LightGBM treats it as categorical (optimal per-category splits); XGB/CatBoost treat it as a numeric column. Column order is identical across backends.")
     p.add_argument("--importance-sample", type=int, default=1_000_000, help="Rows for pilot importance.")
@@ -91,7 +96,35 @@ def select_topk_by_importance(frame, raw_feature_cols, k, sample_rows, build_kwa
     return top
 
 
-def build_fold_features(train_df, valid_df, raw_cols, cs_source_cols, rolling_source_cols, rolling_windows, interaction_pairs=None):
+def load_per_asset_specs(csv_path, raw_feature_cols, k):
+    """Read per-asset feature importance CSV and return ``[(asset_id, feature_name), ...]``.
+
+    The CSV (produced by scripts/eda_m3_perasset.py) has an ``asset_id`` column
+    and one column per raw feature holding LGB gain. For each asset, the top-K
+    features by gain (restricted to ``raw_feature_cols``) become a spec pair.
+    Returns a flat list of (asset_id, feature_name) in asset-then-rank order,
+    which is the column order of the per-asset block.
+    """
+    import csv as _csv
+    feats = [c for c in raw_feature_cols]
+    feat_set = set(feats)
+    specs = []
+    with open(csv_path, newline="") as fh:
+        reader = _csv.DictReader(fh)
+        for row in reader:
+            try:
+                aid = int(row["asset_id"])
+            except (KeyError, ValueError):
+                continue
+            scored = [(c, float(row[c])) for c in row
+                      if c in feat_set and row[c] not in (None, "")]
+            scored.sort(key=lambda kv: kv[1], reverse=True)
+            for fname, _g in scored[:k]:
+                specs.append((aid, fname))
+    return specs
+
+
+def build_fold_features(train_df, valid_df, raw_cols, cs_source_cols, rolling_source_cols, rolling_windows, interaction_pairs=None, per_asset_specs=None):
     """Attach cross-sectional + rolling + interaction features to a fold's train/valid.
 
     Cross-sectional features are stateless per time_id. Rolling features are
@@ -103,8 +136,9 @@ def build_fold_features(train_df, valid_df, raw_cols, cs_source_cols, rolling_so
     new_cs_cols = []
     new_roll_cols = []
     new_inter_cols = []
+    new_pa_cols = per_asset_column_names(per_asset_specs) if per_asset_specs else []
 
-    def _attach(df, cs_src, roll_src, wins, inter_pairs):
+    def _attach(df, cs_src, roll_src, wins, inter_pairs, pa_specs):
         out = df
         cs_cols = []
         if cs_src:
@@ -120,14 +154,17 @@ def build_fold_features(train_df, valid_df, raw_cols, cs_source_cols, rolling_so
         inter_cols = []
         if inter_pairs:
             out, inter_cols = build_interaction_features(out, inter_pairs)
-        return out, cs_cols, roll_cols, inter_cols
+        pa_cols = []
+        if pa_specs:
+            out, pa_cols = build_per_asset_features(out, pa_specs)
+        return out, cs_cols, roll_cols, inter_cols, pa_cols
 
-    train_out, train_cs, train_roll, train_inter = _attach(
-        train_df, cs_source_cols, rolling_source_cols, rolling_windows, interaction_pairs)
-    valid_out, valid_cs, valid_roll, valid_inter = _attach(
-        valid_df, cs_source_cols, rolling_source_cols, rolling_windows, interaction_pairs)
-    # cs/roll/inter column name sets are identical across train/valid (same sources).
-    return train_out, valid_out, train_cs, train_roll, train_inter
+    train_out, train_cs, train_roll, train_inter, train_pa = _attach(
+        train_df, cs_source_cols, rolling_source_cols, rolling_windows, interaction_pairs, per_asset_specs)
+    valid_out, valid_cs, valid_roll, valid_inter, valid_pa = _attach(
+        valid_df, cs_source_cols, rolling_source_cols, rolling_windows, interaction_pairs, per_asset_specs)
+    # cs/roll/inter/pa column name sets are identical across train/valid (same sources).
+    return train_out, valid_out, train_cs, train_roll, train_inter, new_pa_cols
 
 
 def main():
@@ -240,6 +277,17 @@ def main():
         print(f"\n  running {len(folds)}-fold expanding-window CV ...\n")
 
     scores = []
+    # Per-asset masked feature specs (loaded once, shared across folds). Each
+    # spec (asset_id, feature_name) becomes a within-row column = feature value
+    # on that asset's rows, 0 elsewhere. Drift-safe like interactions.
+    per_asset_specs = []
+    if args.per_asset_topk > 0:
+        per_asset_specs = load_per_asset_specs(
+            args.per_asset_importance_csv, raw_feature_cols, args.per_asset_topk)
+        print(f"  per-asset topk={args.per_asset_topk}: {len(per_asset_specs)} specs "
+              f"({len(per_asset_specs)} extra cols) from {args.per_asset_importance_csv}")
+        if not per_asset_specs:
+            print("  WARNING: no per-asset specs loaded; --per-asset-topk has no effect.")
     if (not args.fresh) and scores_path.exists():
         try:
             saved = json.loads(scores_path.read_text(encoding="utf-8"))
@@ -292,17 +340,17 @@ def main():
         print(f"  train time_ids: {len(train_times)}  valid time_ids: {len(valid_times)}")
         print(f"  train rows: {len(train_df)}  valid rows: {len(valid_df)}")
 
-        train_df, valid_df, cs_cols, roll_cols, inter_cols = build_fold_features(
+        train_df, valid_df, cs_cols, roll_cols, inter_cols, pa_cols = build_fold_features(
             train_df, valid_df, raw_feature_cols, cs_source_cols, rolling_source_cols, rolling_windows,
-            interaction_pairs=interaction_pairs,
+            interaction_pairs=interaction_pairs, per_asset_specs=per_asset_specs,
         )
         # fill inf -> 0 on engineered cols; raw NaN left for LGBM native handling
-        engineered_cols = cs_cols + roll_cols + inter_cols
+        engineered_cols = cs_cols + roll_cols + inter_cols + pa_cols
         if engineered_cols:
             train_df = fill_infinite(train_df, engineered_cols)
             valid_df = fill_infinite(valid_df, engineered_cols)
 
-        all_feature_cols = list(raw_feature_cols) + cs_cols + roll_cols + inter_cols
+        all_feature_cols = list(raw_feature_cols) + cs_cols + roll_cols + inter_cols + pa_cols
         # Optionally prepend asset_id as a feature column (index 0). LightGBM
         # uses it as categorical; XGB/Cat treat it as numeric. Column order is
         # identical across backends so the inference side can reproduce it.
@@ -593,7 +641,8 @@ def main():
                 for w in rolling_windows:
                     roll_cols += [f"{s}_rm_{w}", f"{s}_rs_{w}"]
         inter_cols = interaction_column_names(interaction_pairs) if interaction_pairs else []
-        all_feature_cols = list(raw_feature_cols) + cs_cols + roll_cols + inter_cols
+        pa_cols = per_asset_column_names(per_asset_specs) if per_asset_specs else []
+        all_feature_cols = list(raw_feature_cols) + cs_cols + roll_cols + inter_cols + pa_cols
         if asset_as_cat:
             all_feature_cols = ["asset_id"] + all_feature_cols
 
@@ -609,6 +658,10 @@ def main():
             "rolling_windows": list(rolling_windows),
             "interaction_source_columns": [list(p) for p in interaction_pairs] if interaction_pairs else [],
             "interaction_feature_columns": inter_cols,
+            "per_asset_topk": args.per_asset_topk,
+            "per_asset_specs": [[a, f] for a, f in per_asset_specs],
+            "per_asset_feature_columns": pa_cols,
+            "per_asset_importance_source": args.per_asset_importance_csv if per_asset_specs else None,
             "neutralize_alpha": getattr(args, "neutralize_alpha", 0.0),
             "neutralize_features": drift_features,
             "target_transform": args.target_transform,

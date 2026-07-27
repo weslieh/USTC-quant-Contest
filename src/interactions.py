@@ -82,3 +82,63 @@ def interaction_block_numpy(Xraw: np.ndarray, pair_idx: np.ndarray) -> np.ndarra
         out[:, 2 * k] = a * b
         out[:, 2 * k + 1] = a / (b + EPS)
     return out
+
+
+def per_asset_column_names(per_asset_specs):
+    """Deterministic column names for per-asset masked features.
+
+    ``per_asset_specs`` is a list of ``(asset_id, feature_name)`` pairs. The
+    column for ``(a, f)`` is ``pa_{a}_{f}`` — the value of feature ``f`` on
+    rows where ``asset_id == a``, and 0 elsewhere. This is a within-row
+    transform (no cross-sample / cross-time state), so it is identical at
+    training (Polars) and inference (numpy) and safe under distribution drift
+    — same rationale as the interaction features above.
+    """
+    return [f"pa_{a}_{f}" for a, f in per_asset_specs]
+
+
+def build_per_asset_features(df, per_asset_specs):
+    """Add per-asset masked feature columns (Polars, training side).
+
+    For each ``(asset_id a, feature_name f)`` in ``per_asset_specs`` add a
+    column ``pa_{a}_{f}`` equal to ``f`` on rows with ``asset_id == a`` and 0
+    elsewhere. NaN in ``f`` becomes 0 (mirrored exactly on the numpy side by
+    ``per_asset_block_numpy``). Returns ``(df_with_cols, new_col_names)``.
+    """
+    if not per_asset_specs:
+        return df, []
+    exprs = []
+    new_cols = []
+    for a, f in per_asset_specs:
+        col = pl.when(pl.col(f).is_nan()).then(0.0).otherwise(pl.col(f))
+        exprs.append(
+            pl.when(pl.col("asset_id") == a).then(col).otherwise(0.0).alias(f"pa_{a}_{f}")
+        )
+        new_cols.append(f"pa_{a}_{f}")
+    return df.with_columns(exprs), new_cols
+
+
+def per_asset_block_numpy(Xraw, asset_ids, pa_spec_idx):
+    """Inference mirror of ``build_per_asset_features``.
+
+    Args:
+        Xraw: (n_rows, n_raw) float array of raw features (NaNs allowed).
+        asset_ids: (n_rows,) int array of asset ids.
+        pa_spec_idx: (n_specs, 2) int array; each row is
+            ``[asset_id, raw_feature_index]``.
+
+    Returns:
+        (n_rows, n_specs) float32 array; column k is ``Xraw[:, f]`` on rows
+        where ``asset_ids == a`` (NaN->0), else 0. Order matches
+        ``per_asset_column_names``.
+    """
+    Xraw = np.asarray(Xraw, dtype=np.float64)
+    X = np.where(np.isfinite(Xraw), Xraw, 0.0)
+    asset_ids = np.asarray(asset_ids)
+    n = X.shape[0]
+    out = np.zeros((n, pa_spec_idx.shape[0]), dtype=np.float32)
+    for k, (aid, fidx) in enumerate(pa_spec_idx):
+        mask = asset_ids == aid
+        if mask.any():
+            out[mask, k] = X[mask, fidx]
+    return out

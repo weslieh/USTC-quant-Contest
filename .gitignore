@@ -24,6 +24,9 @@ strategy_ensemble/ensemble_meta.json
 strategy_ensemble/booster_fold_*.txt
 strategy_ensemble/booster_fold_*.json
 strategy_ensemble/cv/
+# Pilot / experimental training outputs (regenerated; not tracked)
+strategy_*_pilot/
+strategy_*_pa/
 
 # Python
 __pycache__/

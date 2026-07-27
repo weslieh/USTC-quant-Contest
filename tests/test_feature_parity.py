@@ -195,6 +195,70 @@ def test_interaction_parity():
         f"interaction mismatch, max diff = {np.max(np.abs(got - exp))}"
 
 
+# ---------------- per-asset masked feature parity ----------------
+
+def test_per_asset_parity():
+    """Per-asset masked features (feature value on that asset's rows, 0 else)
+    must match between the Polars training helper (src.interactions) and the
+    numpy inference mirror (strategy.main._per_asset_block), fed one time_id
+    at a time. Includes NaN handling and the asset-mismatch-must-be-zero rule."""
+    from src.interactions import build_per_asset_features, per_asset_column_names
+    from strategy.main import _per_asset_block
+
+    rng = np.random.default_rng(11)
+    n_times, n_assets, n_feat = 12, 15, 5
+    rows = []
+    for t in range(n_times):
+        for a in range(n_assets):
+            row = {"time_id": t, "asset_id": a}
+            for f in range(n_feat):
+                v = rng.standard_normal()
+                if rng.random() < 0.05:
+                    v = np.nan
+                row[f"feature_{f:03d}"] = float(v)
+            rows.append(row)
+    df = pl.DataFrame(rows)
+    raw_cols = [f"feature_{f:03d}" for f in range(n_feat)]
+    # Specs: a few (asset_id, feature) pairs, including an asset whose feature
+    # has NaN on some rows, and a feature reused across assets.
+    specs = [(0, "feature_000"), (0, "feature_003"), (3, "feature_002"),
+             (3, "feature_000"), (14, "feature_004")]
+    col_names = per_asset_column_names(specs)
+    out, new_cols = build_per_asset_features(df, specs)
+    assert new_cols == col_names
+
+    # Inference: verify per time_id slice (the real inference path) AND whole
+    # frame (within-row so slice-agnostic).
+    Xraw = df.select(raw_cols).to_numpy().astype(np.float32)
+    asset_ids = df["asset_id"].to_numpy()
+    pa_spec_idx = np.array([[a, raw_cols.index(f)] for a, f in specs], dtype=np.intp)
+
+    # whole frame
+    got_full = _per_asset_block(Xraw, asset_ids, pa_spec_idx)
+    exp = out.select(col_names).to_numpy().astype(np.float32)
+    assert got_full.shape == exp.shape, (got_full.shape, exp.shape)
+    assert np.allclose(got_full, exp, atol=1e-5, equal_nan=False), \
+        f"per-asset mismatch (full), max diff = {np.max(np.abs(got_full - exp))}"
+
+    # per time_id slice (mirrors real inference: one time_id at a time)
+    for t in range(n_times):
+        mask = df["time_id"].to_numpy() == t
+        got_slice = _per_asset_block(Xraw[mask], asset_ids[mask], pa_spec_idx)
+        exp_slice = exp[mask]
+        assert got_slice.shape == exp_slice.shape
+        assert np.allclose(got_slice, exp_slice, atol=1e-5, equal_nan=False), \
+            f"per-asset mismatch at time_id={t}"
+
+    # Rule: asset != spec asset => column must be exactly 0.
+    for k, (aid, _f) in enumerate(specs):
+        col = got_full[:, k]
+        other = asset_ids != aid
+        assert np.all(col[other] == 0.0), f"spec {k}: nonzero on non-{aid} rows"
+
+    # Column order matches specs order.
+    assert col_names == [f"pa_{a}_{f}" for a, f in specs]
+
+
 # ---------------- target rank transform parity ----------------
 
 def test_target_rank_transform():

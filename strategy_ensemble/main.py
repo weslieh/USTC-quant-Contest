@@ -28,6 +28,25 @@ def _interaction_block(Xraw: np.ndarray, pair_idx: np.ndarray) -> np.ndarray:
     return out
 
 
+def _per_asset_block(Xraw: np.ndarray, asset_ids: np.ndarray, pa_spec_idx: np.ndarray) -> np.ndarray:
+    """Inference mirror of src.interactions.build_per_asset_features.
+
+    Self-contained (no src import). For each spec (asset_id a, raw feature idx f)
+    the column is Xraw[:, f] on rows where asset_ids == a (NaN->0), else 0.
+    Within-row, drift-safe. ``pa_spec_idx`` is (n_specs, 2): [asset_id, feat_idx].
+    """
+    X = np.where(np.isfinite(Xraw), Xraw.astype(np.float64), 0.0)
+    asset_ids = np.asarray(asset_ids)
+    out = np.zeros((X.shape[0], pa_spec_idx.shape[0]), dtype=np.float32)
+    for k in range(pa_spec_idx.shape[0]):
+        aid = pa_spec_idx[k, 0]
+        fidx = pa_spec_idx[k, 1]
+        mask = asset_ids == aid
+        if mask.any():
+            out[mask, k] = X[mask, fidx]
+    return out
+
+
 def _neutralize_predictions(preds: np.ndarray, features: np.ndarray, alpha: float = 0.5) -> np.ndarray:
     """Orthogonalize predictions against features (self-contained mirror of
     src.neutralization.neutralize_predictions).
@@ -237,6 +256,14 @@ class Model:
              if a in self.raw_feature_columns and b in self.raw_feature_columns],
             dtype=np.intp,
         ).reshape(-1, 2)
+        # Per-asset masked feature spec (shared by all subs).
+        self.per_asset_specs = [tuple(s) for s in s0_meta.get("per_asset_specs", [])]
+        self._pa_spec_idx = np.asarray(
+            [[int(aid), self.raw_feature_columns.index(fname)]
+             for aid, fname in self.per_asset_specs
+             if fname in self.raw_feature_columns],
+            dtype=np.intp,
+        ).reshape(-1, 2) if self.per_asset_specs else np.empty((0, 2), dtype=np.intp)
         # asset_id prepended as first feature column (shared spec from subs[0]).
         self.asset_as_categorical = bool(s0_meta.get("asset_as_categorical", False))
         self.rolling = _RollingBuf(len(self._roll_src_idx), self.rolling_windows)
@@ -274,6 +301,9 @@ class Model:
         # Interactions: within-row pairwise mul/div (feature axis), no state.
         if self._inter_pair_idx.size:
             feats.append(_interaction_block(Xraw, self._inter_pair_idx))
+        # Per-asset masked features: within-row, no state (drift-safe).
+        if self._pa_spec_idx.size:
+            feats.append(_per_asset_block(Xraw, asset_ids, self._pa_spec_idx))
         return np.concatenate(feats, axis=1)
 
     def predict(self, test: pd.DataFrame) -> np.ndarray:
