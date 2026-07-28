@@ -24,6 +24,21 @@ import torch
 import torch.nn as nn
 
 
+def _per_asset_block(Xraw, asset_ids, pa_spec_idx):
+    """Inference mirror of src.interactions.build_per_asset_features (self-contained).
+    For each spec (asset_id a, raw feature idx f): column = Xraw[:,f] on rows
+    where asset_ids==a (NaN->0), else 0. pa_spec_idx: (n_specs,2) [asset_id, feat_idx]."""
+    X = np.where(np.isfinite(Xraw), Xraw.astype(np.float64), 0.0)
+    asset_ids = np.asarray(asset_ids)
+    out = np.zeros((X.shape[0], pa_spec_idx.shape[0]), dtype=np.float32)
+    for k in range(pa_spec_idx.shape[0]):
+        aid = pa_spec_idx[k, 0]; fidx = pa_spec_idx[k, 1]
+        mask = asset_ids == aid
+        if mask.any():
+            out[mask, k] = X[mask, fidx]
+    return out
+
+
 class _PeriodicFeatureEmbedding(nn.Module):
     def __init__(self, n_features, n_periodic=16, emb_dim=8):
         super().__init__()
@@ -93,6 +108,14 @@ class Model:
         self.raw_feature_columns = list(meta["raw_feature_columns"])
         self.target_std = float(meta.get("target_std") or 1.0)
         self.device = torch.device("cpu")
+        # Per-asset masked feature spec (optional).
+        self.per_asset_specs = [tuple(s) for s in meta.get("per_asset_specs", [])]
+        self._pa_spec_idx = np.asarray(
+            [[int(aid), self.raw_feature_columns.index(fname)]
+             for aid, fname in self.per_asset_specs
+             if fname in self.raw_feature_columns],
+            dtype=np.intp,
+        ).reshape(-1, 2) if self.per_asset_specs else np.empty((0, 2), dtype=np.intp)
         self.models = []
         for fname in meta.get("fold_files", []):
             m = _TabularNN(
@@ -120,8 +143,13 @@ class Model:
         Xraw = test.to_numpy(dtype=np.float32, copy=True)[:, col_pos]
         Xraw = np.nan_to_num(Xraw, nan=0.0, posinf=0.0, neginf=0.0)
         asset_ids = test["asset_id"].to_numpy().astype(np.int64)
+        if self._pa_spec_idx.size:
+            pa = _per_asset_block(Xraw, asset_ids, self._pa_spec_idx)
+            Xfull = np.hstack([Xraw, pa])
+        else:
+            Xfull = Xraw
 
-        Xt = torch.from_numpy(Xraw)
+        Xt = torch.from_numpy(Xfull)
         aidt = torch.from_numpy(asset_ids)
         preds = np.zeros(Xraw.shape[0], dtype=np.float64)
         with torch.no_grad():

@@ -45,6 +45,7 @@ import torch.nn as nn
 from src.dataset import load_train
 from src.cv import time_cv_split
 from src.features import get_feature_columns
+from src.interactions import build_per_asset_features, per_asset_column_names
 from src.metrics import weighted_zero_mean_r2
 
 
@@ -136,6 +137,8 @@ def parse_args():
     p.add_argument("--epochs", type=int, default=40)
     p.add_argument("--batch-size", type=int, default=8192)
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--per-asset-topk", type=int, default=0, help="Per-asset masked feature columns (0=off). Same scheme as train.py: each asset's top-K raw features (by --per-asset-importance-csv) become a column = feature value on that asset's rows, 0 elsewhere. Fed as extra input features to the NN.")
+    p.add_argument("--per-asset-importance-csv", type=str, default="out/eda_full/m3_per_asset_importance.csv")
     p.add_argument("--n-periodic", type=int, default=16)
     p.add_argument("--feat-emb-dim", type=int, default=8)
     p.add_argument("--asset-emb-dim", type=int, default=8)
@@ -170,6 +173,17 @@ def main():
     n_features = len(raw_feature_cols)
     n_assets = 15
     print(f"  raw features: {n_features}")
+
+    # Per-asset masked feature specs (optional, same scheme as train.py).
+    per_asset_specs = []
+    pa_col_names = []
+    if args.per_asset_topk > 0:
+        from train import load_per_asset_specs
+        per_asset_specs = load_per_asset_specs(
+            args.per_asset_importance_csv, raw_feature_cols, args.per_asset_topk)
+        pa_col_names = per_asset_column_names(per_asset_specs)
+        n_features = n_features + len(pa_col_names)
+        print(f"  per-asset topk={args.per_asset_topk}: +{len(pa_col_names)} cols -> {n_features} total input features")
 
     folds = time_cv_split(frame, n_folds=args.n_folds, valid_frac=args.valid_frac, embargo=args.embargo)
     print(f"  folds: {len(folds)}")
@@ -206,6 +220,13 @@ def main():
 
         X_tr = np.nan_to_num(train_df.select(raw_feature_cols).to_numpy().astype(np.float32))
         X_va = np.nan_to_num(valid_df.select(raw_feature_cols).to_numpy().astype(np.float32))
+        if per_asset_specs:
+            train_df_pa, _ = build_per_asset_features(train_df, per_asset_specs)
+            valid_df_pa, _ = build_per_asset_features(valid_df, per_asset_specs)
+            pa_tr = np.nan_to_num(train_df_pa.select(pa_col_names).to_numpy().astype(np.float32))
+            pa_va = np.nan_to_num(valid_df_pa.select(pa_col_names).to_numpy().astype(np.float32))
+            X_tr = np.hstack([X_tr, pa_tr])
+            X_va = np.hstack([X_va, pa_va])
         aid_tr = train_df["asset_id"].to_numpy().astype(np.int64)
         aid_va = valid_df["asset_id"].to_numpy().astype(np.int64)
         y_tr = train_df["target"].to_numpy().astype(np.float32)
@@ -304,6 +325,8 @@ def main():
             "asset_emb_dim": args.asset_emb_dim,
             "hidden": args.hidden,
             "n_blocks": args.n_blocks,
+            "per_asset_specs": [[a, f] for a, f in per_asset_specs],
+            "per_asset_feature_columns": pa_col_names,
             "n_folds": len(folds),
             "fold_files": fold_files,
             "target_std": target_std,
