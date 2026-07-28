@@ -142,6 +142,7 @@ def parse_args():
     p.add_argument("--hidden", type=int, default=256)
     p.add_argument("--n-blocks", type=int, default=4)
     p.add_argument("--dropout", type=float, default=0.1)
+    p.add_argument("--weight-decay", type=float, default=0.0, help="Adam L2 weight decay (the single-partition probe overfits fast — epoch 0-1 peak then declines; try 1e-4..1e-3 to regularize).")
     p.add_argument("--patience", type=int, default=8)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out-dir", default="strategy_nn")
@@ -230,7 +231,7 @@ def main():
         n_params = sum(p.numel() for p in model.parameters())
         if fold_idx == 0:
             print(f"  model params: {n_params:,}")
-        opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+        opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
 
         n = Xtr_t.shape[0]
