@@ -32,6 +32,8 @@ def parse_args():
     p.add_argument("--adv-val-ratio", type=float, default=0.0, help="Use adversarial validation split instead of time CV. 0=off.")
     p.add_argument("--av-reweight", action="store_true", help="Reweight train samples by AV odds-ratio (test-likeness) to correct drift. Train-only; inference unchanged.")
     p.add_argument("--reweight-clip-quantile", type=float, default=0.99, help="Winsorize p_like_test at this quantile before odds-ratio (anti-explosion when AUC~1.0).")
+    p.add_argument("--responder-weight-mode", choices=["off", "abs03", "abstop5"], default="off", help="Train-only sample-weight modulation by responder signal (inference unchanged; test has no responder). 'abs03'=scale up rows by |responder_03| (strongest target-correlated responder, corr 0.817); 'abstop5'=by mean abs of top-5 correlated responders. Up-weights signal-dense rows (opposite direction of AV-reweight).")
+    p.add_argument("--responder-weight-strength", type=float, default=0.5, help="Alpha for responder-weight: factor in [1-alpha, 1+alpha] (abstop5) or clip band around 1 (abs03). 0=no effect.")
     p.add_argument("--multi-task", action="store_true", help="Train dual models: target direction (classification) and target value (regression).")
     p.add_argument("--neutralize-alpha", type=float, default=0.0, help="Proportion of neutralization to apply during inference against drift features. 0=off.")
     p.add_argument("--neutralize-topk", type=int, default=10, help="Number of top drift features to neutralize against.")
@@ -380,6 +382,36 @@ def main():
             print(f"  [reweight] w_train mean={w_train.mean():.4f} "
                   f"(odds-ratio clip q={args.reweight_clip_quantile})")
 
+        # Responder-weight: train-only sample-weight modulation by responder
+        # signal (test has no responder; inference is unchanged). Up-weights
+        # signal-dense rows — opposite direction of AV-reweight (which up-weighted
+        # the weak-signal test-like tail and died at -14%). responder_03 has
+        # weighted |corr with target| = 0.817 (EDA m2). The competition weight is
+        # preserved as the base; we only nudge the GBDT's fitting focus. valid
+        # keeps original w_valid so CV still reports the true leaderboard metric.
+        if args.responder_weight_mode != "off" and args.responder_weight_strength > 0:
+            alpha = args.responder_weight_strength
+            if args.responder_weight_mode == "abs03":
+                r = train_df["responder_03"].to_numpy().astype(np.float64)
+                r = np.where(np.isfinite(r), np.abs(r), 0.0)
+                m = r.mean() if r.mean() > 1e-12 else 1.0
+                # normalized |responder_03| centered at 1, clipped to [1-alpha, 1+alpha]
+                factor = np.clip(r / m, 1 - alpha, 1 + alpha).astype(np.float32)
+            else:  # abstop5
+                cols = ["responder_03", "responder_28", "responder_02",
+                        "responder_29", "responder_18"]
+                rs = np.stack([np.where(np.isfinite(train_df[c].to_numpy().astype(np.float64)),
+                                        np.abs(train_df[c].to_numpy().astype(np.float64)), 0.0)
+                               for c in cols], axis=1)
+                score = rs.mean(axis=1)
+                # sigmoid of z-score -> (0,1), mapped to [1-alpha, 1+alpha]
+                z = (score - score.mean()) / (score.std() + 1e-12)
+                factor = (1.0 + alpha * (1.0 / (1.0 + np.exp(-z)) - 0.5) * 2.0).astype(np.float32)
+            w_train = w_train * factor
+            print(f"  [responder-weight] mode={args.responder_weight_mode} "
+                  f"strength={alpha} -> w_train mean={w_train.mean():.4f} "
+                  f"factor range=[{factor.min():.3f},{factor.max():.3f}]")
+
         # target_std and the inverse-CDF LUT are in the ORIGINAL target scale
         # (the clip bound and the inverse map must both be original-scale).
         if target_std is None:
@@ -649,6 +681,8 @@ def main():
         meta = {
             "backend": args.backend + ("_mt" if getattr(args, "multi_task", False) else ""),
             "asset_as_categorical": asset_as_cat,
+            "responder_weight_mode": args.responder_weight_mode,
+            "responder_weight_strength": args.responder_weight_strength,
             "feature_columns": all_feature_cols,
             "raw_feature_columns": list(raw_feature_cols),
             "cs_source_columns": cs_source_cols,
