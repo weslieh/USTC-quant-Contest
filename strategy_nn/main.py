@@ -16,6 +16,7 @@ Usage (public-LB CSV, no inference limits):
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -109,7 +110,12 @@ class Model:
         meta = json.loads((here / "model_meta.json").read_text(encoding="utf-8"))
         self.raw_feature_columns = list(meta["raw_feature_columns"])
         self.target_std = float(meta.get("target_std") or 1.0)
-        self.device = torch.device("cpu")
+        self.standardize_target = bool(meta.get("standardize_target", False))
+        # Device: the private-LB eval env has no GPU, so default to CPU. For
+        # public-LB CSV generation (GPU allowed, no inference limits) set the
+        # NN_DEVICE env var to "cuda" instead of hand-editing this line.
+        dev = os.environ.get("NN_DEVICE", "cpu")
+        self.device = torch.device(dev if torch.cuda.is_available() or dev == "cpu" else "cpu")
         # Per-asset masked feature spec (optional).
         self.per_asset_specs = [tuple(s) for s in meta.get("per_asset_specs", [])]
         self._pa_spec_idx = np.asarray(
@@ -125,7 +131,7 @@ class Model:
                 n_periodic=meta["n_periodic"], feat_emb_dim=meta["feat_emb_dim"],
                 asset_emb_dim=meta["asset_emb_dim"], hidden=meta["hidden"],
                 n_blocks=meta["n_blocks"], dropout=meta.get("dropout", 0.1),
-            )
+            ).to(self.device)
             try:
                 state = torch.load(here / fname, map_location=self.device, weights_only=True)
             except TypeError:
@@ -151,14 +157,18 @@ class Model:
         else:
             Xfull = Xraw
 
-        Xt = torch.from_numpy(Xfull)
-        aidt = torch.from_numpy(asset_ids)
+        Xt = torch.from_numpy(Xfull).to(self.device)
+        aidt = torch.from_numpy(asset_ids).to(self.device)
         preds = np.zeros(Xraw.shape[0], dtype=np.float64)
         with torch.no_grad():
             for m in self.models:
-                preds += m(Xt, aidt).numpy()
+                preds += m(Xt, aidt).detach().cpu().numpy()
         preds /= max(1, len(self.models))
 
+        # If training standardized the target (y / target_std), unscale the
+        # prediction back to the original target scale before clipping.
+        if self.standardize_target:
+            preds = preds * self.target_std
         clip = 3.0 * self.target_std
         preds = np.clip(preds, -clip, clip)
         bad = ~np.isfinite(preds)

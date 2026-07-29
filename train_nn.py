@@ -53,6 +53,59 @@ def swish(x):
     return x * torch.sigmoid(x)
 
 
+def hybrid_loss(pred, y, w, w_corr, w_mse, eps=1e-8):
+    """Weighted Pearson correlation + weighted MSE.
+
+    The competition metric is zero-mean R^2 = 1 - Σw(y-ŷ)²/Σw·y², whose baseline is
+    the *zero* prediction. Plain weighted MSE has a deep basin at the zero/mean
+    prediction (loss ≈ Var(y) ≈ 1.19, R² ≈ 0) and the signal gradient is ~600x
+    weaker than the "pull toward mean" gradient, so the net collapses there.
+
+    Correlation is scale- and shift-invariant: a constant prediction gives
+    corr=0 (a saddle, not a minimum), so the only path to lower loss is the
+    actual signal *direction*. The MSE term then pins the output *magnitude*.
+    Per-batch weighted correlation (batches shuffle across all time_ids/assets,
+    so each batch is a representative sample; the per-batch gradient is what
+    escapes the collapse basin). The +eps in the denominator bounds the
+    division as var_p -> 0 (the collapse state, where predictions are ~constant).
+    """
+    wsum = w.sum().clamp(min=eps)
+    p_mean = (w * pred).sum() / wsum
+    y_mean = (w * y).sum() / wsum
+    p_c = pred - p_mean
+    y_c = y - y_mean
+    cov = (w * p_c * y_c).sum()
+    var_p = (w * p_c * p_c).sum().clamp(min=eps)
+    var_y = (w * y_c * y_c).sum().clamp(min=eps)
+    corr = cov / (var_p.sqrt() * var_y.sqrt() + eps)
+    corr = corr.clamp(-2.0, 2.0)  # safety net vs NaN before (1 - corr)
+    mse = ((pred - y) ** 2 * w).sum() / wsum
+    return w_corr * (1.0 - corr) + w_mse * mse
+
+
+def corr_mse_weights(epoch, args):
+    """Two-phase corr/mse schedule for hybrid loss.
+
+    Phase 1 [0, corr_only_epochs): pure correlation (w_mse=0) to escape the
+    collapse basin and learn signal direction.
+    Transition [corr_only_epochs, corr_only_epochs+transition): linearly ramp
+    w_mse 0 -> mse_weight and w_corr corr_weight -> corr_weight (stays flat;
+    the ramp only adds MSE in).
+    Phase 2: fixed w_corr=corr_weight, w_mse=mse_weight to recover magnitude.
+    Returns (w_corr, w_mse).
+    """
+    if args.loss_mode == "mse":
+        return 0.0, 1.0
+    t0 = args.corr_only_epochs
+    tm = args.corr_mse_transition
+    if epoch < t0:
+        return args.corr_weight if args.corr_weight > 0 else 1.0, 0.0
+    if epoch < t0 + tm:
+        frac = (epoch - t0) / max(1, tm)
+        return args.corr_weight, args.mse_weight * frac
+    return args.corr_weight, args.mse_weight
+
+
 class PeriodicFeatureEmbedding(nn.Module):
     """Periodic (PLR-style) embedding for continuous features.
 
@@ -154,8 +207,21 @@ def parse_args():
     p.add_argument("--hidden", type=int, default=256)
     p.add_argument("--n-blocks", type=int, default=4)
     p.add_argument("--dropout", type=float, default=0.1)
-    p.add_argument("--weight-decay", type=float, default=0.0, help="Adam L2 weight decay (the single-partition probe overfits fast — epoch 0-1 peak then declines; try 1e-4..1e-3 to regularize).")
-    p.add_argument("--patience", type=int, default=8)
+    p.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW decoupled weight decay (the single-partition probe overfits fast — epoch 0-1 peak then declines; 1e-4 is a gentle regularizer).")
+    p.add_argument("--patience", type=int, default=15)
+    # --- collapse-fix: hybrid correlation+MSE loss + warmup + target std ---
+    p.add_argument("--loss-mode", choices=["mse", "hybrid"], default="hybrid",
+                   help="mse=original weighted MSE (exact reproduction of pre-fix behavior); hybrid=weighted corr + MSE (default, fixes collapse-to-mean).")
+    p.add_argument("--corr-only-epochs", type=int, default=8,
+                   help="Phase-1 epochs of pure correlation (w_mse=0) to escape the collapse basin.")
+    p.add_argument("--corr-mse-transition", type=int, default=4,
+                   help="Linear ramp epochs adding the MSE term back in (recovers output magnitude).")
+    p.add_argument("--corr-weight", type=float, default=0.1, help="Final correlation term weight.")
+    p.add_argument("--mse-weight", type=float, default=1.0, help="Final MSE term weight.")
+    p.add_argument("--warmup-epochs", type=int, default=3, help="Linear LR warmup epochs (from 0.1*lr).")
+    p.add_argument("--standardize-target", dest="standardize_target", action="store_true", default=True,
+                   help="Divide y by target_std for training; unscale predictions at inference. Keeps the corr/mse ratio scale-invariant.")
+    p.add_argument("--no-standardize-target", dest="standardize_target", action="store_false")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out-dir", default="strategy_nn")
     p.add_argument("--save-model", action="store_true")
@@ -244,6 +310,11 @@ def main():
         w_va = valid_df["weight"].to_numpy().astype(np.float32)
         if target_std is None:
             target_std = float(np.std(y_tr))
+        # Keep the raw (unscaled) valid target for metric-scale scoring.
+        y_va_raw = y_va
+        if args.standardize_target and target_std > 0:
+            y_tr = y_tr / target_std
+            y_va = y_va / target_std
 
         Xtr_t = torch.tensor(X_tr, device=device)
         aidtr_t = torch.tensor(aid_tr, device=device)
@@ -261,8 +332,20 @@ def main():
         n_params = sum(p.numel() for p in model.parameters())
         if fold_idx == 0:
             print(f"  model params: {n_params:,}")
-        opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
+        opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        # Warmup then cosine over the post-warmup horizon. The old schedule used
+        # CosineAnnealingLR(T_max=epochs) but training early-stops at ~epoch 12, so
+        # cosine never decayed — the net trained at near-peak lr the whole time.
+        # Warmup lets the correlation gradient build direction before full lr hits
+        # the flat collapse saddle; cosine now actually decays before early-stop.
+        warmup = max(0, min(args.warmup_epochs, args.epochs - 1))
+        if warmup > 0:
+            sched = torch.optim.lr_scheduler.SequentialLR(opt, [
+                torch.optim.lr_scheduler.LinearLR(opt, start_factor=0.1, total_iters=warmup),
+                torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs - warmup),
+            ], milestones=[warmup])
+        else:
+            sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
 
         n = Xtr_t.shape[0]
         n_batches = math.ceil(n / args.batch_size)
@@ -275,12 +358,16 @@ def main():
             model.train()
             perm = torch.randperm(n, device=device)
             tot_loss = 0.0
+            w_corr, w_mse = corr_mse_weights(epoch, args)
             for b in range(n_batches):
                 idx = perm[b * args.batch_size:(b + 1) * args.batch_size]
                 xb = Xtr_t[idx]; aidb = aidtr_t[idx]; yb = ytr_t[idx]; wb = wtr_t[idx]
                 opt.zero_grad()
                 pred = model(xb, aidb)
-                l = ((pred - yb) ** 2 * wb).sum() / wb.sum().clamp(min=1e-8)
+                if args.loss_mode == "hybrid":
+                    l = hybrid_loss(pred, yb, wb, w_corr, w_mse)
+                else:
+                    l = ((pred - yb) ** 2 * wb).sum() / wb.sum().clamp(min=1e-8)
                 l.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 opt.step()
@@ -293,7 +380,17 @@ def main():
                 for i in range(0, Xva_t.shape[0], 65536):
                     preds.append(model(Xva_t[i:i + 65536], aidva_t[i:i + 65536]).cpu().numpy())
                 pred_va_np = np.concatenate(preds)
-            score = weighted_zero_mean_r2(y_va, pred_va_np, w_va)
+            # Score in the original (unscaled) target scale so CV R² matches the
+            # competition metric regardless of standardize_target. Unscale the
+            # predictions the same way the inference script will.
+            if args.standardize_target and target_std > 0:
+                score = weighted_zero_mean_r2(y_va_raw, pred_va_np * target_std, w_va)
+            else:
+                score = weighted_zero_mean_r2(y_va, pred_va_np, w_va)
+            if epoch % 2 == 0 or epoch == args.epochs - 1:
+                print(f"  epoch {epoch}: train_loss={tot_loss/n_batches:.4f} "
+                      f"valid_r2={score:.6f} (best {best_score:.6f}@{best_epoch}) "
+                      f"[w_corr={w_corr:.2f} w_mse={w_mse:.2f}]")
             if score > best_score:
                 best_score = score
                 best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
@@ -301,9 +398,6 @@ def main():
                 bad_epochs = 0
             else:
                 bad_epochs += 1
-            if epoch % 2 == 0 or epoch == args.epochs - 1:
-                print(f"  epoch {epoch}: train_loss={tot_loss/n_batches:.4f} "
-                      f"valid_r2={score:.6f} (best {best_score:.6f}@{best_epoch})")
             if bad_epochs >= args.patience:
                 print(f"  early stop at epoch {epoch}, best {best_score:.6f}@{best_epoch}")
                 break
@@ -334,6 +428,8 @@ def main():
             "asset_emb_dim": args.asset_emb_dim,
             "hidden": args.hidden,
             "n_blocks": args.n_blocks,
+            "loss_mode": args.loss_mode,
+            "standardize_target": bool(args.standardize_target),
             "per_asset_specs": [[a, f] for a, f in per_asset_specs],
             "per_asset_feature_columns": pa_col_names,
             "n_folds": len(folds),

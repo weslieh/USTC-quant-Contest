@@ -73,6 +73,15 @@ def parse_args():
     p.add_argument("--out-dir", default="strategy")
     p.add_argument("--save-model", action="store_true")
     p.add_argument("--fresh", action="store_true")
+    # --- Distillation: blend an external (NN) OOF prediction into the target ---
+    p.add_argument("--aux-prediction-parquet", type=str, default=None,
+                   help="Parquet with OOF predictions (cols: time_id, asset_id, <aux-pred-col>) for distillation. The prediction must be out-of-fold w.r.t. this model's training rows.")
+    p.add_argument("--aux-mode", choices=["soft_target", "feature"], default="soft_target",
+                   help="soft_target: train on y_soft=(1-lambda)*y+lambda*aux_pred (private-LB-usable, inference unchanged). feature: inject aux pred as a feature column (public-LB-only, needs the aux model at inference).")
+    p.add_argument("--aux-lambda", type=float, default=0.3,
+                   help="Blend weight for soft_target: y_soft=(1-lambda)*y+lambda*aux_pred.")
+    p.add_argument("--aux-pred-col", type=str, default="oof_nn",
+                   help="Column name in --aux-prediction-parquet holding the aux prediction.")
     return p.parse_args()
 
 
@@ -122,6 +131,47 @@ def load_per_asset_specs(csv_path, raw_feature_cols, k):
             for fname, _g in scored[:k]:
                 specs.append((aid, fname))
     return specs
+
+
+def load_aux_predictions(parquet_path):
+    """Load a distillation aux-prediction parquet (time_id, asset_id, weight, target,
+    <pred-col>) eagerly as a Polars DataFrame. The OOF predictions are out-of-fold
+    w.r.t. the teacher model and depend only on row features, so blending them into
+    the student's training target leaks no label.
+    """
+    print(f"  loading aux predictions: {parquet_path}")
+    aux = pl.read_parquet(parquet_path)
+    return aux
+
+
+def join_aux_to_fold(fold_df, aux, pred_col, target_std):
+    """Left-join the aux OOF prediction onto a fold's rows by (time_id, asset_id),
+    standardize it to the target scale (match weighted std), and return a numpy
+    array aligned with fold_df's row order. Rows with no aux OOF (the earliest
+    time_ids, never held out by the teacher's CV) get 0 so the caller can mask them
+    out and keep the raw target there.
+    """
+    aux_slim = aux.select(["time_id", "asset_id", "weight", pred_col])
+    joined = fold_df.select(["time_id", "asset_id"]).join(
+        aux_slim, on=["time_id", "asset_id"], how="left")
+    raw = joined[pred_col].to_numpy().astype(np.float64)
+    w = joined["weight"].to_numpy().astype(np.float64)
+    has = np.isfinite(raw)
+    if has.any():
+        # Weighted std of the available OOF preds, to rescale them to target scale.
+        wsub = w[has]; psub = raw[has]
+        wmean = (wsub * psub).sum() / max(wsub.sum(), 1e-12)
+        wvar = (wsub * (psub - wmean) ** 2).sum() / max(wsub.sum(), 1e-12)
+        wstd = float(np.sqrt(max(wvar, 1e-12)))
+        scale = target_std / wstd if wstd > 0 else 1.0
+        print(f"    [aux] OOF coverage {has.mean()*100:.1f}% of fold rows; "
+              f"OOF weighted std {wstd:.4f} -> scale {scale:.3f} to target_std {target_std:.4f}")
+    else:
+        scale = 1.0
+        print(f"    [aux] OOF coverage 0% of fold rows (no blend this fold)")
+    out = np.zeros(len(fold_df), dtype=np.float32)
+    out[has] = (raw[has] * scale).astype(np.float32)
+    return out, has.astype(np.float32)
 
 
 def build_fold_features(train_df, valid_df, raw_cols, cs_source_cols, rolling_source_cols, rolling_windows, interaction_pairs=None, per_asset_specs=None):
@@ -302,6 +352,25 @@ def main():
     target_std = None
     target_lut = None  # inverse-CDF LUT for target-transform=rank (built fold 0)
 
+    # Distillation: load the teacher (NN) OOF predictions once. The aux OOF covers
+    # only the teacher's held-out folds (~last half of time_ids); earliest rows have
+    # no OOF and keep the raw target. Only soft_target is implemented (private-LB-
+    # usable, inference unchanged); feature mode is public-LB-only.
+    aux_frame = None
+    if args.aux_prediction_parquet:
+        if args.aux_mode == "feature":
+            raise NotImplementedError(
+                "aux-mode=feature needs the teacher model at inference (public-LB-only); "
+                "not implemented. Use --aux-mode soft_target.")
+        aux_frame = load_aux_predictions(args.aux_prediction_parquet)
+        # target_std from the aux frame's target column (same train distribution).
+        _yt = aux_frame["target"].to_numpy().astype(np.float64)
+        _wt = aux_frame["weight"].to_numpy().astype(np.float64)
+        _wmean = (_wt * _yt).sum() / max(_wt.sum(), 1e-12)
+        aux_target_std = float(np.sqrt((_wt * (_yt - _wmean) ** 2).sum() / max(_wt.sum(), 1e-12)))
+        print(f"  [aux] loaded {aux_frame.height} OOF rows; aux target_std {aux_target_std:.4f}; "
+              f"lambda {args.aux_lambda}")
+
     def _score_valid(pred, y_valid_raw_, w_valid_):
         """Compute weighted R² in the ORIGINAL target scale.
 
@@ -388,6 +457,17 @@ def main():
                 target_lut = build_inverse_cdf_lut(y_train_raw, n_points=1001)
                 print(f"  [target-transform] rank mode; built inverse-CDF LUT "
                       f"(target_std={target_std:.4f})")
+
+        # Distillation: blend the teacher (NN) OOF prediction into the training
+        # target (soft labels). Only rows that have an OOF prediction are blended;
+        # the rest (earliest time_ids, never held out by the teacher) keep the raw
+        # target. y_valid stays raw so CV still measures the true metric.
+        if aux_frame is not None and args.aux_mode == "soft_target" and args.aux_lambda > 0:
+            aux_tr, has_tr = join_aux_to_fold(train_df, aux_frame, args.aux_pred_col, target_std)
+            y_train = (1.0 - args.aux_lambda) * y_train_raw + args.aux_lambda * aux_tr
+            n_blend = int(has_tr.sum())
+            print(f"  [distill] soft_target lambda={args.aux_lambda}: blended {n_blend}/{len(y_train)} "
+                  f"train rows ({100*n_blend/max(len(y_train),1):.1f}%), rest keep raw target")
 
         # Transform the regression target to per-time_id rank percentile so the
         # model learns a scale-invariant ordering. Inference maps the predicted
@@ -666,6 +746,9 @@ def main():
             "neutralize_features": drift_features,
             "target_transform": args.target_transform,
             "target_quantile_lut": target_lut,
+            "aux_mode": args.aux_mode if aux_frame is not None else None,
+            "aux_lambda": args.aux_lambda if aux_frame is not None else None,
+            "requires_aux_model": False,  # soft_target bakes signal into splits; inference is standalone
             "n_folds": len(fold_boosters),
             "fold_files": saved_fold_files,
             "target_std": target_std,
