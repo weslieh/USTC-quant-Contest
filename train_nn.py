@@ -72,8 +72,11 @@ class PeriodicFeatureEmbedding(nn.Module):
         # learnable frequencies (initialized ~ N(0,0.1)); shape (n_features, n_periodic)
         self.freq = nn.Parameter(torch.randn(n_features, n_periodic) * 0.1)
         self.phase = nn.Parameter(torch.zeros(n_features, n_periodic))
-        # per-feature linear: 2*n_periodic -> emb_dim (applied independently per feature)
-        self.mix = nn.Parameter(torch.randn(2 * n_periodic, emb_dim) * 0.02)
+        # per-feature linear: 2*n_periodic -> emb_dim. Larger init (0.2) so the
+        # feature embedding signal is not drowned out by the asset embedding
+        # (which defaults to N(0,1), std 1.0). With 0.02 init the feat_emb output
+        # std was 0.057 vs asset_emb 1.05 — features were invisible.
+        self.mix = nn.Parameter(torch.randn(2 * n_periodic, emb_dim) * 0.2)
 
     def forward(self, x):
         # x: (B, n_features)
@@ -109,7 +112,11 @@ class TabularNN(nn.Module):
         self.feat_emb = PeriodicFeatureEmbedding(n_features, n_periodic, feat_emb_dim)
         in_dim = n_features * feat_emb_dim + asset_emb_dim
         self.asset_emb = nn.Embedding(n_assets, asset_emb_dim)
-        self.ln_in = nn.LayerNorm(in_dim)
+        # Normalize each embedding separately before concat so the asset embedding
+        # (std ~1.0) does not drown out the feature embedding. Previously a single
+        # LayerNorm over the concat let asset dominate (feat std 0.057 vs asset 1.05).
+        self.ln_feat = nn.LayerNorm(n_features * feat_emb_dim)
+        self.ln_asset = nn.LayerNorm(asset_emb_dim)
         self.proj = nn.Linear(in_dim, hidden)
         self.trunk = ResMLP(hidden, n_blocks, dropout)
         self.ln_out = nn.LayerNorm(hidden)
@@ -118,8 +125,10 @@ class TabularNN(nn.Module):
     def forward(self, x_raw, asset_id):
         fe = self.feat_emb(x_raw)  # (B, n_feat*emb_dim)
         ae = self.asset_emb(asset_id)  # (B, asset_emb_dim)
+        # separate normalization keeps feature signal on equal footing with asset
+        fe = self.ln_feat(fe)
+        ae = self.ln_asset(ae)
         h = torch.cat([fe, ae], dim=-1)
-        h = self.ln_in(h)
         h = self.proj(h)
         h = self.trunk(h)
         h = self.ln_out(h)

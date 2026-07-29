@@ -47,7 +47,7 @@ class _PeriodicFeatureEmbedding(nn.Module):
         self.emb_dim = emb_dim
         self.freq = nn.Parameter(torch.randn(n_features, n_periodic) * 0.1)
         self.phase = nn.Parameter(torch.zeros(n_features, n_periodic))
-        self.mix = nn.Parameter(torch.randn(2 * n_periodic, emb_dim) * 0.02)
+        self.mix = nn.Parameter(torch.randn(2 * n_periodic, emb_dim) * 0.2)
 
     def forward(self, x):
         proj = x.unsqueeze(-1) * self.freq.unsqueeze(0) + self.phase.unsqueeze(0)
@@ -81,7 +81,8 @@ class _TabularNN(nn.Module):
         self.feat_emb = _PeriodicFeatureEmbedding(n_features, n_periodic, feat_emb_dim)
         in_dim = n_features * feat_emb_dim + asset_emb_dim
         self.asset_emb = nn.Embedding(n_assets, asset_emb_dim)
-        self.ln_in = nn.LayerNorm(in_dim)
+        self.ln_feat = nn.LayerNorm(n_features * feat_emb_dim)
+        self.ln_asset = nn.LayerNorm(asset_emb_dim)
         self.proj = nn.Linear(in_dim, hidden)
         self.trunk = _ResMLP(hidden, n_blocks, dropout)
         self.ln_out = nn.LayerNorm(hidden)
@@ -90,8 +91,9 @@ class _TabularNN(nn.Module):
     def forward(self, x_raw, asset_id):
         fe = self.feat_emb(x_raw)
         ae = self.asset_emb(asset_id)
+        fe = self.ln_feat(fe)
+        ae = self.ln_asset(ae)
         h = torch.cat([fe, ae], dim=-1)
-        h = self.ln_in(h)
         h = self.proj(h)
         h = self.trunk(h)
         h = self.ln_out(h)
