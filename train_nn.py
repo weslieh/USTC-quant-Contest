@@ -54,55 +54,70 @@ def swish(x):
 
 
 def hybrid_loss(pred, y, w, w_corr, w_mse, eps=1e-8):
-    """Weighted Pearson correlation + weighted MSE.
+    """Weighted "cosine-to-zero" correlation + weighted MSE.
 
     The competition metric is zero-mean R^2 = 1 - Σw(y-ŷ)²/Σw·y², whose baseline is
     the *zero* prediction. Plain weighted MSE has a deep basin at the zero/mean
     prediction (loss ≈ Var(y) ≈ 1.19, R² ≈ 0) and the signal gradient is ~600x
     weaker than the "pull toward mean" gradient, so the net collapses there.
 
-    Correlation is scale- and shift-invariant: a constant prediction gives
-    corr=0 (a saddle, not a minimum), so the only path to lower loss is the
-    actual signal *direction*. The MSE term then pins the output *magnitude*.
-    Per-batch weighted correlation (batches shuffle across all time_ids/assets,
-    so each batch is a representative sample; the per-batch gradient is what
-    escapes the collapse basin). The +eps in the denominator bounds the
-    division as var_p -> 0 (the collapse state, where predictions are ~constant).
+    A standard Pearson correlation is the WRONG escape: it is both scale- and
+    shift-invariant, so it ignores any additive bias β in pred=α·signal+β. But the
+    metric is NOT shift-invariant (its baseline is zero, not the mean), so a biased
+    prediction gets a large Σw·β² penalty and R² goes strongly negative — which is
+    exactly the failure seen with the first version (best -0.0046@epoch9).
+
+    Instead we use a *zero-referenced* similarity that matches the metric's
+    structure: maximize  <w·ŷ, y> / (‖ŷ‖_w · ‖y‖_w)  WITHOUT centering ŷ (we still
+    center y since E[y]≈0 and the metric denominator is Σw·y²). A constant nonzero
+    prediction makes the numerator ~0 while ‖ŷ‖ stays large, so the similarity is
+    ~0 — a constant is a bad solution, but a *zero* prediction is also 0/0→0
+    (handled by eps), not a basin the optimizer slides down. The MSE term pins the
+    output magnitude to the target scale. Per-batch optimization is fine here
+    because each batch is a representative shuffle across all time_ids/assets.
+
+    With standardized targets (y/σ_y, so Σw·y²/Σw ≈ 1), MSE is exactly 1-R² on the
+    batch — the loss and the metric share their minimum.
     """
     wsum = w.sum().clamp(min=eps)
-    p_mean = (w * pred).sum() / wsum
+    # Center y (mean ≈ 0 already); do NOT center pred — bias must be penalized.
     y_mean = (w * y).sum() / wsum
-    p_c = pred - p_mean
     y_c = y - y_mean
-    cov = (w * p_c * y_c).sum()
-    var_p = (w * p_c * p_c).sum().clamp(min=eps)
-    var_y = (w * y_c * y_c).sum().clamp(min=eps)
-    corr = cov / (var_p.sqrt() * var_y.sqrt() + eps)
-    corr = corr.clamp(-2.0, 2.0)  # safety net vs NaN before (1 - corr)
+    # Zero-referenced similarity: <w·pred, y_c> / (||pred||_w · ||y_c||_w).
+    num = (w * pred * y_c).sum()
+    # ||pred||_w with the eps floor: a near-constant pred (collapse state) gives a
+    # tiny numerator over a finite ||pred|| -> similarity ~0, not a gradient trap.
+    norm_p = (w * pred * pred).sum().clamp(min=eps).sqrt()
+    norm_y = (w * y_c * y_c).sum().clamp(min=eps).sqrt()
+    sim = num / (norm_p * norm_y + eps)
+    sim = sim.clamp(-2.0, 2.0)  # safety net vs NaN before (1 - sim)
     mse = ((pred - y) ** 2 * w).sum() / wsum
-    return w_corr * (1.0 - corr) + w_mse * mse
+    return w_corr * (1.0 - sim) + w_mse * mse
 
 
 def corr_mse_weights(epoch, args):
-    """Two-phase corr/mse schedule for hybrid loss.
+    """MSE-anchored similarity schedule for hybrid loss.
 
-    Phase 1 [0, corr_only_epochs): pure correlation (w_mse=0) to escape the
-    collapse basin and learn signal direction.
-    Transition [corr_only_epochs, corr_only_epochs+transition): linearly ramp
-    w_mse 0 -> mse_weight and w_corr corr_weight -> corr_weight (stays flat;
-    the ramp only adds MSE in).
-    Phase 2: fixed w_corr=corr_weight, w_mse=mse_weight to recover magnitude.
+    Phase 1 [0, corr_only_epochs): high similarity weight + a small MSE anchor
+    (mse_anchor) so the prediction magnitude never drifts to a degenerate scale
+    while the similarity term escapes the collapse basin. The similarity is
+    scale-invariant, so without the anchor the pure-corr phase can blow up or
+    shrink the magnitude arbitrarily and the later MSE ramp has to undo it.
+    Transition [corr_only_epochs, corr_only_epochs+transition): ramp the MSE term
+    from mse_anchor up to mse_weight.
+    Phase 2: fixed w_corr=corr_weight, w_mse=mse_weight.
     Returns (w_corr, w_mse).
     """
     if args.loss_mode == "mse":
         return 0.0, 1.0
     t0 = args.corr_only_epochs
     tm = args.corr_mse_transition
+    anchor = args.mse_anchor
     if epoch < t0:
-        return args.corr_weight if args.corr_weight > 0 else 1.0, 0.0
+        return args.corr_weight, anchor
     if epoch < t0 + tm:
         frac = (epoch - t0) / max(1, tm)
-        return args.corr_weight, args.mse_weight * frac
+        return args.corr_weight, anchor + (args.mse_weight - anchor) * frac
     return args.corr_weight, args.mse_weight
 
 
@@ -209,18 +224,20 @@ def parse_args():
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW decoupled weight decay (the single-partition probe overfits fast — epoch 0-1 peak then declines; 1e-4 is a gentle regularizer).")
     p.add_argument("--patience", type=int, default=15)
-    # --- collapse-fix: hybrid correlation+MSE loss + warmup + target std ---
+    # --- collapse-fix: hybrid zero-referenced-similarity+MSE loss + warmup ---
     p.add_argument("--loss-mode", choices=["mse", "hybrid"], default="hybrid",
-                   help="mse=original weighted MSE (exact reproduction of pre-fix behavior); hybrid=weighted corr + MSE (default, fixes collapse-to-mean).")
-    p.add_argument("--corr-only-epochs", type=int, default=8,
-                   help="Phase-1 epochs of pure correlation (w_mse=0) to escape the collapse basin.")
+                   help="mse=original weighted MSE (exact reproduction of pre-fix behavior); hybrid=zero-referenced similarity + MSE (default, fixes collapse-to-mean without the bias blowup of plain Pearson corr).")
+    p.add_argument("--corr-only-epochs", type=int, default=4,
+                   help="Phase-1 epochs of high-similarity + small MSE anchor to escape the collapse basin while keeping magnitude bounded.")
     p.add_argument("--corr-mse-transition", type=int, default=4,
-                   help="Linear ramp epochs adding the MSE term back in (recovers output magnitude).")
-    p.add_argument("--corr-weight", type=float, default=0.1, help="Final correlation term weight.")
+                   help="Linear ramp epochs raising the MSE term from mse_anchor to mse_weight.")
+    p.add_argument("--corr-weight", type=float, default=1.0, help="Similarity term weight (1-sim).")
     p.add_argument("--mse-weight", type=float, default=1.0, help="Final MSE term weight.")
+    p.add_argument("--mse-anchor", type=float, default=0.1,
+                   help="Small MSE weight kept on during the similarity phase so the (scale-invariant) similarity can't drift the output magnitude to a degenerate scale. Was 0 in v1 -> magnitude blew up, R² went negative.")
     p.add_argument("--warmup-epochs", type=int, default=3, help="Linear LR warmup epochs (from 0.1*lr).")
     p.add_argument("--standardize-target", dest="standardize_target", action="store_true", default=True,
-                   help="Divide y by target_std for training; unscale predictions at inference. Keeps the corr/mse ratio scale-invariant.")
+                   help="Divide y by target_std for training; unscale predictions at inference. With y/σ_y, Σw·y²/Σw≈1 so MSE is exactly 1-R² on the batch.")
     p.add_argument("--no-standardize-target", dest="standardize_target", action="store_false")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out-dir", default="strategy_nn")
@@ -388,9 +405,15 @@ def main():
             else:
                 score = weighted_zero_mean_r2(y_va, pred_va_np, w_va)
             if epoch % 2 == 0 or epoch == args.epochs - 1:
+                # Diagnostics: prediction mean/std (in standardized scale) reveal
+                # the two failure modes — a large |mean| is an additive bias the
+                # zero-mean-R² metric punishes; a std far from 1 is a magnitude
+                # blow-up/shrink that the unscale step won't correct.
+                pm = float(pred_va_np.mean()); ps = float(pred_va_np.std())
                 print(f"  epoch {epoch}: train_loss={tot_loss/n_batches:.4f} "
                       f"valid_r2={score:.6f} (best {best_score:.6f}@{best_epoch}) "
-                      f"[w_corr={w_corr:.2f} w_mse={w_mse:.2f}]")
+                      f"[w_corr={w_corr:.2f} w_mse={w_mse:.2f}] "
+                      f"pred μ={pm:+.3f} σ={ps:.3f}")
             if score > best_score:
                 best_score = score
                 best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
