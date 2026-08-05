@@ -190,14 +190,26 @@ def test_rolling_parity_diff_no_std():
     assert got.shape == exp.shape, (got.shape, exp.shape)
     assert np.allclose(got, exp, atol=1e-4), \
         f"rolling(diff,no-std) mismatch, max diff = {np.max(np.abs(got - exp))}"
-    # diff1 column must equal current - lag1 (within-row check, all sources).
+    # diff1 == current - lag1 only where a lag exists (fill>0). On each asset's
+    # first time_id both train (null→0 via nan_to_num) and inference (fill==0
+    # → all-zeros) yield diff1=0, so restrict the identity check to rows that
+    # have a previous value for that asset.
     per = 2 + len(windows)  # [lag1, diff1, rm_w...]
     cur_all = df.select(src).to_numpy().astype(np.float32)
-    for s_idx in range(len(src)):
-        lag = got[:, s_idx * per]
-        dif = got[:, s_idx * per + 1]
-        cur = cur_all[:, s_idx]
-        assert np.allclose(dif, cur - lag, atol=1e-4), f"diff1 != current - lag1 for {src[s_idx]}"
+    aids_arr = df["asset_id"].to_numpy()
+    seen = set()
+    for i in range(len(df)):
+        aid = int(aids_arr[i])
+        has_lag = aid in seen
+        seen.add(aid)
+        if not has_lag:
+            continue
+        for s_idx in range(len(src)):
+            lag = got[i, s_idx * per]
+            dif = got[i, s_idx * per + 1]
+            cur = cur_all[i, s_idx]
+            assert abs(dif - (cur - lag)) <= 1e-4, \
+                f"diff1 != current - lag1 at row {i} src {src[s_idx]}: {dif} vs {cur - lag}"
 
 
 # ---------------- interaction parity ----------------
