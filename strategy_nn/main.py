@@ -111,6 +111,11 @@ class Model:
         self.raw_feature_columns = list(meta["raw_feature_columns"])
         self.target_std = float(meta.get("target_std") or 1.0)
         self.standardize_target = bool(meta.get("standardize_target", False))
+        # Cap torch threads per the official inference requirement (default -1
+        # causes cache thrashing). MAX_CPU_THREADS<=4 for local timing, <=8 live.
+        max_cpu = max(1, min(8, int(os.environ.get("MAX_CPU_THREADS", "4"))))
+        torch.set_num_threads(max_cpu)
+        torch.set_num_interop_threads(max_cpu)
         # Device: the private-LB eval env has no GPU, so default to CPU. For
         # public-LB CSV generation (GPU allowed, no inference limits) set the
         # NN_DEVICE env var to "cuda" instead of hand-editing this line.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -8,6 +9,27 @@ import pandas as pd
 import lightgbm as lgb
 
 EPS = 1e-8
+
+# Official inference env provides up to 8 cores but requires strategies to cap
+# threads manually (leaving the default -1 causes severe cache thrashing and
+# per-step time instability -> timeouts). Default 4 matches the local-timing
+# spec (<=4 for local timing, <=8 for the live private LB). Override via env.
+MAX_CPU_THREADS = max(1, min(8, int(os.environ.get("MAX_CPU_THREADS", "4"))))
+
+
+def _apply_thread_caps():
+    os.environ.setdefault("OMP_NUM_THREADS", str(MAX_CPU_THREADS))
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", str(MAX_CPU_THREADS))
+    os.environ.setdefault("MKL_NUM_THREADS", str(MAX_CPU_THREADS))
+    try:
+        import torch as _torch
+        _torch.set_num_threads(MAX_CPU_THREADS)
+        _torch.set_num_interop_threads(MAX_CPU_THREADS)
+    except Exception:
+        pass
+
+
+_apply_thread_caps()
 
 
 def _interaction_block(Xraw: np.ndarray, pair_idx: np.ndarray) -> np.ndarray:
@@ -197,7 +219,11 @@ class _SubModel:
                 pred_val = reg.predict(X)
                 preds += pred_prob * pred_val
             return preds / len(self.reg_boosters)
-        else:
+        elif self.backend == "lgb":
+            for b in self.boosters:
+                preds += b.predict(X, num_threads=MAX_CPU_THREADS)
+            return preds / len(self.boosters)
+        else:  # xgb / cat
             for b in self.boosters:
                 preds += b.predict(X)
             return preds / len(self.boosters)
