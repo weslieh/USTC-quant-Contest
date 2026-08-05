@@ -224,20 +224,28 @@ def parse_args():
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW decoupled weight decay (the single-partition probe overfits fast — epoch 0-1 peak then declines; 1e-4 is a gentle regularizer).")
     p.add_argument("--patience", type=int, default=15)
-    # --- collapse-fix: hybrid zero-referenced-similarity+MSE loss + warmup ---
-    p.add_argument("--loss-mode", choices=["mse", "hybrid"], default="hybrid",
-                   help="mse=original weighted MSE (exact reproduction of pre-fix behavior); hybrid=zero-referenced similarity + MSE (default, fixes collapse-to-mean without the bias blowup of plain Pearson corr).")
+    # --- loss mode: MSE is the default (see loss-mode help for why hybrid was retired) ---
+    p.add_argument("--loss-mode", choices=["mse", "hybrid"], default="mse",
+                   help="mse=plain weighted MSE on the raw target (DEFAULT — reproduces the 0.00281 public-LB baseline). "
+                        "hybrid=zero-referenced similarity + MSE (EXPERIMENTAL, RETIRED: two attempts regressed vs plain MSE — "
+                        "v1 Pearson-corr gave CV -0.0046 [bias blowup, metric is not shift-invariant], v2 zero-ref similarity "
+                        "gave CV 0.000231 [magnitude pushed to σ≈1 by standardized target, but the metric-optimal σ is ~0.04 "
+                        "since the signal is only ~0.002 of target variance]). The 'collapse to σ≈0.04' is the magnitude-OPTIMAL "
+                        "solution, not a bug; plain MSE already solves for the optimal α. Kept behind the flag for reference.")
     p.add_argument("--corr-only-epochs", type=int, default=4,
-                   help="Phase-1 epochs of high-similarity + small MSE anchor to escape the collapse basin while keeping magnitude bounded.")
+                   help="[hybrid only] Phase-1 epochs of high-similarity + small MSE anchor.")
     p.add_argument("--corr-mse-transition", type=int, default=4,
-                   help="Linear ramp epochs raising the MSE term from mse_anchor to mse_weight.")
-    p.add_argument("--corr-weight", type=float, default=1.0, help="Similarity term weight (1-sim).")
-    p.add_argument("--mse-weight", type=float, default=1.0, help="Final MSE term weight.")
+                   help="[hybrid only] Linear ramp epochs raising the MSE term from mse_anchor to mse_weight.")
+    p.add_argument("--corr-weight", type=float, default=1.0, help="[hybrid only] Similarity term weight (1-sim).")
+    p.add_argument("--mse-weight", type=float, default=1.0, help="[hybrid only] Final MSE term weight.")
     p.add_argument("--mse-anchor", type=float, default=0.1,
-                   help="Small MSE weight kept on during the similarity phase so the (scale-invariant) similarity can't drift the output magnitude to a degenerate scale. Was 0 in v1 -> magnitude blew up, R² went negative.")
+                   help="[hybrid only] Small MSE weight kept on during the similarity phase to bound magnitude.")
     p.add_argument("--warmup-epochs", type=int, default=3, help="Linear LR warmup epochs (from 0.1*lr).")
-    p.add_argument("--standardize-target", dest="standardize_target", action="store_true", default=True,
-                   help="Divide y by target_std for training; unscale predictions at inference. With y/σ_y, Σw·y²/Σw≈1 so MSE is exactly 1-R² on the batch.")
+    p.add_argument("--standardize-target", dest="standardize_target", action="store_true", default=False,
+                   help="Divide y by target_std for training; unscale predictions at inference. OFF by default — "
+                        "standardization pushes the prediction σ toward 1.0, but the metric-optimal σ is ~0.04 (the signal "
+                        "is ~0.002 of target variance), so standardization makes MSE chase the WRONG magnitude and R² goes "
+                        "negative. Only meaningful with --loss-mode hybrid.")
     p.add_argument("--no-standardize-target", dest="standardize_target", action="store_false")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out-dir", default="strategy_nn")
