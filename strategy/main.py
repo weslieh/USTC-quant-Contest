@@ -138,13 +138,22 @@ class _RollingBuffer:
 
     Each asset owns a fixed (max_w, n_source) numpy buffer (oldest at index 0)
     plus a fill count. compute/push are vectorized over source columns.
+
+    Output layout per source matches build_rolling_features:
+      [lag1, (diff1), rm_w1, (rs_w1), rm_w2, (rs_w2), ...]
+    where diff1 is included iff add_diff and rs_w iff add_std. Note diff1 uses
+    the CURRENT row (passed in) minus lag1, since build_rolling_features computes
+    it as current - shift(1) without excluding the current row (it is a within-
+    row transform of current + the per-asset lag).
     """
 
-    def __init__(self, n_source, windows, n_assets_hint=16):
+    def __init__(self, n_source, windows, n_assets_hint=16, add_diff=False, add_std=True):
         self.n_source = n_source
         self.windows = list(windows)
         self.max_w = max(self.windows) if self.windows else 1
         self.n_assets_hint = n_assets_hint
+        self.add_diff = bool(add_diff)
+        self.add_std = bool(add_std)
         self._buf = {}   # asset_id -> (np.ndarray[max_w, n_source], fill_count)
 
     def _get(self, asset_id):
@@ -156,26 +165,32 @@ class _RollingBuffer:
         return b
 
     def compute(self, asset_id, current_row):
-        """Return flat vector per source: [lag1, rm_w1, rs_w1, rm_w2, rs_w2, ...]."""
+        """Return flat vector per source: [lag1, (diff1), rm_w1, (rs_w1), ...]."""
         arr, fill = self._get(asset_id)
-        out = np.empty(self.n_source * (1 + 2 * len(self.windows)), dtype=np.float32)
+        per = 1 + (1 if self.add_diff else 0) + len(self.windows) * (1 + (1 if self.add_std else 0))
+        out = np.empty(self.n_source * per, dtype=np.float32)
         if fill == 0:
             out[:] = 0.0
             return out
         # history is arr[0:fill], oldest..newest; lag1 = newest.
         hist = arr[:fill]
         newest = hist[-1]                      # (n_source,)
+        cur = np.asarray(current_row, dtype=np.float64).reshape(-1)
         o = 0
         for k in range(self.n_source):
-            out[o] = newest[k]
+            out[o] = newest[k]                 # lag1
             o += 1
+            if self.add_diff:
+                out[o] = cur[k] - newest[k]    # diff1 = current - lag1
+                o += 1
             col = hist[:, k]
             for w in self.windows:
                 window = col[-w:]
-                out[o] = window.mean()
+                out[o] = window.mean()         # rm_w
                 o += 1
-                out[o] = window.std(ddof=1) if window.size > 1 else 0.0
-                o += 1
+                if self.add_std:
+                    out[o] = window.std(ddof=1) if window.size > 1 else 0.0  # rs_w
+                    o += 1
         return out
 
     def push(self, asset_id, current_row):
@@ -210,6 +225,8 @@ class Model:
         self.rolling_source_columns = list(meta.get("rolling_source_columns", []))
         self.rolling_feature_columns = list(meta.get("rolling_feature_columns", []))
         self.rolling_windows = list(meta.get("rolling_windows", []))
+        self.rolling_add_diff = bool(meta.get("rolling_add_diff", False))
+        self.rolling_add_std = bool(meta.get("rolling_add_std", True))
         self.feature_columns = list(meta["feature_columns"])  # full ordered list
         self.target_std = float(meta.get("target_std") or 1.0)
         self.backend = meta.get("backend", "lgb")
@@ -298,7 +315,8 @@ class Model:
              if c in self.raw_feature_columns], dtype=np.intp
         )
 
-        self.rolling = _RollingBuffer(len(self._roll_src_idx), self.rolling_windows)
+        self.rolling = _RollingBuffer(len(self._roll_src_idx), self.rolling_windows,
+                                      add_diff=self.rolling_add_diff, add_std=self.rolling_add_std)
         self.last_time_id: int | None = None
 
     def _build_features(self, test: pd.DataFrame) -> np.ndarray:
@@ -333,7 +351,8 @@ class Model:
         # Rolling: per-asset history (current row excluded), push after compute.
         if self._roll_src_idx.size and self.rolling_windows:
             n_roll = self._roll_src_idx.size
-            block_w = 1 + 2 * len(self.rolling_windows)
+            per = 1 + (1 if self.rolling_add_diff else 0) + len(self.rolling_windows) * (1 + (1 if self.rolling_add_std else 0))
+            block_w = per
             roll_block = np.zeros((n, n_roll * block_w), dtype=np.float32)
             for i in range(n):
                 aid = int(asset_ids[i])

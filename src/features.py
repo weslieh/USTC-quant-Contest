@@ -75,6 +75,8 @@ def build_rolling_features(
     df,
     feature_cols,
     windows=(10, 20),
+    add_diff=False,
+    add_std=True,
 ):
     """
     Compute per-asset rolling statistics and lag-1 features.
@@ -84,16 +86,35 @@ def build_rolling_features(
     lag-1 / rolling use shift(1) so the current row never enters its own
     window — the inference side mirrors this with a per-asset history buffer
     that is updated *after* the current time_id is predicted.
+
+    Columns produced per source feature ``c``:
+      * ``{c}_lag1``                     (always)
+      * ``{c}_diff1`` = current - lag1   (only if add_diff)
+      * ``{c}_rm_{w}``                   (always, for each window w)
+      * ``{c}_rs_{w}``                   (only if add_std, for each window w)
+
+    The official LightGBM baseline uses lag1 + diff1 + rmean5 (no std); this
+    function supports that construction via add_diff=True, add_std=False.
     """
     df = df.sort(["asset_id", "time_id"])
 
     exprs = []
+    new_cols = []
 
     # lag-1: previous value for the same asset (current row excluded)
     for c in feature_cols:
         exprs.append(
             pl.col(c).shift(1).over("asset_id").alias(f"{c}_lag1")
         )
+        new_cols.append(f"{c}_lag1")
+
+    # diff1: current - lag1 (the one-step change; baseline's diff1)
+    if add_diff:
+        for c in feature_cols:
+            exprs.append(
+                (pl.col(c) - pl.col(c).shift(1).over("asset_id")).alias(f"{c}_diff1")
+            )
+            new_cols.append(f"{c}_diff1")
 
     # rolling mean and std per asset for each window (current row excluded)
     for c in feature_cols:
@@ -105,13 +126,16 @@ def build_rolling_features(
                 .over("asset_id")
                 .alias(f"{c}_rm_{w}")
             )
-            exprs.append(
-                pl.col(c)
-                .rolling_std(window_size=w, min_samples=1)
-                .shift(1)
-                .over("asset_id")
-                .alias(f"{c}_rs_{w}")
-            )
+            new_cols.append(f"{c}_rm_{w}")
+            if add_std:
+                exprs.append(
+                    pl.col(c)
+                    .rolling_std(window_size=w, min_samples=1)
+                    .shift(1)
+                    .over("asset_id")
+                    .alias(f"{c}_rs_{w}")
+                )
+                new_cols.append(f"{c}_rs_{w}")
 
     return df.with_columns(exprs)
 

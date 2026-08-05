@@ -154,6 +154,52 @@ def test_rolling_excludes_current_row():
     assert got[3, 0] == pytest.approx(3.0)
 
 
+def test_rolling_parity_diff_no_std():
+    """The official-baseline construction: lag1 + diff1 + rmean, NO rolling std.
+    Verifies train (Polars build_rolling_features with add_diff=True, add_std=False)
+    matches inference (_RollingBuffer with add_diff=True, add_std=False) one time_id
+    at a time. Column layout per source: [lag1, diff1, rm_w1, rm_w2, ...]."""
+    n_feat, n_assets, n_times, windows = 3, 6, 30, [5, 10]
+    df = _make_panel(n_times=n_times, n_assets=n_assets, n_feat=n_feat, seed=3)
+    src = ["feature_000", "feature_001", "feature_002"]
+    df = df.with_row_index("_orig_idx")
+    out = build_rolling_features(df, src, windows=tuple(windows), add_diff=True, add_std=False)
+    roll_cols = []
+    for s in src:
+        roll_cols.append(f"{s}_lag1")
+        roll_cols.append(f"{s}_diff1")
+        for w in windows:
+            roll_cols.append(f"{s}_rm_{w}")
+
+    buf = _RollingBuffer(n_source=len(src), windows=windows, add_diff=True, add_std=False)
+    raw_full = df.select(src).to_numpy().astype(np.float32)
+    tids = df["time_id"].to_numpy()
+    aids = df["asset_id"].to_numpy()
+    got = np.full((len(df), len(roll_cols)), np.nan, dtype=np.float32)
+    for t in range(n_times):
+        mask = tids == t
+        for i in np.where(mask)[0]:
+            got[i] = buf.compute(int(aids[i]), raw_full[i])
+        for i in np.where(mask)[0]:
+            buf.push(int(aids[i]), raw_full[i])
+
+    order = np.argsort(out["_orig_idx"].to_numpy())
+    exp = out.select(roll_cols).to_numpy()[order].astype(np.float32)
+    exp = np.nan_to_num(exp, nan=0.0, posinf=0.0, neginf=0.0)
+    got = np.nan_to_num(got, nan=0.0, posinf=0.0, neginf=0.0)
+    assert got.shape == exp.shape, (got.shape, exp.shape)
+    assert np.allclose(got, exp, atol=1e-4), \
+        f"rolling(diff,no-std) mismatch, max diff = {np.max(np.abs(got - exp))}"
+    # diff1 column must equal current - lag1 (within-row check, all sources).
+    per = 2 + len(windows)  # [lag1, diff1, rm_w...]
+    cur_all = df.select(src).to_numpy().astype(np.float32)
+    for s_idx in range(len(src)):
+        lag = got[:, s_idx * per]
+        dif = got[:, s_idx * per + 1]
+        cur = cur_all[:, s_idx]
+        assert np.allclose(dif, cur - lag, atol=1e-4), f"diff1 != current - lag1 for {src[s_idx]}"
+
+
 # ---------------- interaction parity ----------------
 
 def test_interaction_parity():

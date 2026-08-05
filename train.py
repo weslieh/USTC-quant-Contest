@@ -39,6 +39,9 @@ def parse_args():
     p.add_argument("--cs-topk", type=int, default=25, help="Top-K raw features for cross-sectional derivs (0=off).")
     p.add_argument("--rolling-windows", type=int, nargs="*", default=[], help="Rolling windows (empty=off).")
     p.add_argument("--rolling-topk", type=int, default=20, help="Top-K raw features for rolling (0=all 323).")
+    p.add_argument("--rolling-add-diff", action="store_true", help="Add diff1 = current - lag1 columns (the official baseline's diff1). Off by default.")
+    p.add_argument("--rolling-no-std", action="store_true", help="Drop rolling-std (rs) columns, keeping only lag/rm/diff. The official baseline uses lag1+diff1+rmean with no std; this flag matches that construction.")
+    p.add_argument("--rolling-select", choices=["importance", "corr"], default="importance", help="How to pick the top-K rolling source features: importance=pilot LGB gain (default, original); corr=abs weighted corr with target (the official baseline's method).")
     p.add_argument("--interaction-topk", type=int, default=0, help="Top-K raw features for pairwise mul/div interactions (0=off). ~K*(K-1)/2 pairs * 2 cols.")
     p.add_argument("--per-asset-topk", type=int, default=0, help="Per-asset masked feature columns (0=off). For each asset, take its top-K raw features (by precomputed importance) and add a column holding that feature's value on that asset's rows and 0 elsewhere. K=5 -> 15*K=75 extra cols. Within-row, drift-safe like interactions.")
     p.add_argument("--per-asset-importance-csv", type=str, default="out/eda_full/m3_per_asset_importance.csv", help="CSV with per-asset feature importance (cols: asset_id, feature_*.). Used to pick each asset's top-K for --per-asset-topk.")
@@ -96,6 +99,43 @@ def select_topk_by_importance(frame, raw_feature_cols, k, sample_rows, build_kwa
     return top
 
 
+def select_topk_by_corr(frame, raw_feature_cols, k, sample_rows):
+    """Top-k raw features by abs weighted Pearson correlation with target.
+
+    This mirrors the official LightGBM baseline's feature selection
+    (data_utils.top_correlated_features): sample by time_id, then rank by
+    |weighted corr(feature, target)|. Used when --rolling-select corr.
+    """
+    if k <= 0 or k >= len(raw_feature_cols):
+        return list(raw_feature_cols)
+    n = max(sample_rows, 1)
+    print(f"  weighted-corr feature ranking on up to {n} rows ...")
+    sample = frame.head(n).collect()
+    y = sample["target"].to_numpy().astype(np.float64)
+    w = sample["weight"].to_numpy().astype(np.float64)
+    w = np.clip(w, 0.0, None)
+    wsum = max(w.sum(), 1e-12)
+    y_mean = (w * y).sum() / wsum
+    y_c = y - y_mean
+    y_scale = float(np.sqrt((w * y_c * y_c).sum() / wsum)) if wsum > 0 else 1.0
+    scored = []
+    for c in raw_feature_cols:
+        x = sample[c].to_numpy().astype(np.float64)
+        x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        x_mean = (w * x).sum() / wsum
+        x_c = x - x_mean
+        x_scale = float(np.sqrt((w * x_c * x_c).sum() / wsum)) if wsum > 0 else 1.0
+        if x_scale <= 1e-12 or y_scale <= 1e-12:
+            score = 0.0
+        else:
+            cov = (w * x_c * y_c).sum() / wsum
+            score = abs(float(cov / (x_scale * y_scale)))
+        scored.append((score, c))
+    scored.sort(key=lambda kv: kv[0], reverse=True)
+    del sample, y, w
+    return [c for _, c in scored[:k]]
+
+
 def load_per_asset_specs(csv_path, raw_feature_cols, k):
     """Read per-asset feature importance CSV and return ``[(asset_id, feature_name), ...]``.
 
@@ -124,7 +164,7 @@ def load_per_asset_specs(csv_path, raw_feature_cols, k):
     return specs
 
 
-def build_fold_features(train_df, valid_df, raw_cols, cs_source_cols, rolling_source_cols, rolling_windows, interaction_pairs=None, per_asset_specs=None):
+def build_fold_features(train_df, valid_df, raw_cols, cs_source_cols, rolling_source_cols, rolling_windows, interaction_pairs=None, per_asset_specs=None, rolling_add_diff=False, rolling_add_std=True):
     """Attach cross-sectional + rolling + interaction features to a fold's train/valid.
 
     Cross-sectional features are stateless per time_id. Rolling features are
@@ -143,14 +183,19 @@ def build_fold_features(train_df, valid_df, raw_cols, cs_source_cols, rolling_so
         cs_cols = []
         if cs_src:
             out, cs_cols = build_cross_sectional_features(out, cs_src)
-        # Rolling column names are deterministic from source + windows.
+        # Rolling column names are deterministic from source + windows + flags.
         roll_cols = []
         if roll_src and wins:
-            out = build_rolling_features(out, roll_src, windows=tuple(wins))
+            out = build_rolling_features(out, roll_src, windows=tuple(wins),
+                                         add_diff=rolling_add_diff, add_std=rolling_add_std)
             for s in roll_src:
                 roll_cols.append(f"{s}_lag1")
+                if rolling_add_diff:
+                    roll_cols.append(f"{s}_diff1")
                 for w in wins:
-                    roll_cols += [f"{s}_rm_{w}", f"{s}_rs_{w}"]
+                    roll_cols.append(f"{s}_rm_{w}")
+                    if rolling_add_std:
+                        roll_cols.append(f"{s}_rs_{w}")
         inter_cols = []
         if inter_pairs:
             out, inter_cols = build_interaction_features(out, inter_pairs)
@@ -231,8 +276,13 @@ def main():
             cs_source_cols = all_top[:args.cs_topk]
             print(f"  cs source cols ({len(cs_source_cols)}): {cs_source_cols[:5]} ...")
         if rolling_windows and args.rolling_topk > 0:
-            rolling_source_cols = all_top[:args.rolling_topk]
-            print(f"  rolling source cols ({len(rolling_source_cols)}): {rolling_source_cols[:5]} ...")
+            if args.rolling_select == "corr":
+                # Official baseline's method: rank by |weighted corr with target|.
+                rolling_source_cols = select_topk_by_corr(
+                    frame, raw_feature_cols, args.rolling_topk, sample_rows=args.importance_sample)
+            else:
+                rolling_source_cols = all_top[:args.rolling_topk]
+            print(f"  rolling source cols ({len(rolling_source_cols)}, select={args.rolling_select}): {rolling_source_cols[:5]} ...")
         elif rolling_windows:
             rolling_source_cols = list(raw_feature_cols)
         if args.interaction_topk > 0:
@@ -343,6 +393,7 @@ def main():
         train_df, valid_df, cs_cols, roll_cols, inter_cols, pa_cols = build_fold_features(
             train_df, valid_df, raw_feature_cols, cs_source_cols, rolling_source_cols, rolling_windows,
             interaction_pairs=interaction_pairs, per_asset_specs=per_asset_specs,
+            rolling_add_diff=args.rolling_add_diff, rolling_add_std=not args.rolling_no_std,
         )
         # fill inf -> 0 on engineered cols; raw NaN left for LGBM native handling
         engineered_cols = cs_cols + roll_cols + inter_cols + pa_cols
@@ -656,6 +707,8 @@ def main():
             "rolling_source_columns": rolling_source_cols,
             "rolling_feature_columns": roll_cols,
             "rolling_windows": list(rolling_windows),
+            "rolling_add_diff": bool(args.rolling_add_diff),
+            "rolling_add_std": bool(not args.rolling_no_std),
             "interaction_source_columns": [list(p) for p in interaction_pairs] if interaction_pairs else [],
             "interaction_feature_columns": inter_cols,
             "per_asset_topk": args.per_asset_topk,
