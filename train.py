@@ -26,6 +26,9 @@ def parse_args():
     p = argparse.ArgumentParser(description="Train LightGBM target model with time-series CV.")
     p.add_argument("--data-root", default="data")
     p.add_argument("--partitions", type=int, default=None, help="Limit to first N train partitions.")
+    p.add_argument("--extra-train-dir", type=str, default=None,
+                   help="Extra directory of parquet partitions to append to training data (e.g. data/train_test, the 8/23 label-backfill / public-test period, time_id 888480+). These rows have weight+target+responder and are the closest training data to the private-LB live period. Appended AFTER the main train so time ordering is preserved.")
+    p.add_argument("--extra-train-partitions", type=int, default=None, help="Limit extra-train-dir to first N partitions.")
     p.add_argument("--n-folds", type=int, default=5)
     p.add_argument("--valid-frac", type=float, default=0.1)
     p.add_argument("--embargo", type=int, default=0, help="Time-id gap between train end and valid start.")
@@ -222,6 +225,20 @@ def main():
 
     print("Loading data ...")
     frame = load_train(args.data_root, partitions=args.partitions)
+    if args.extra_train_dir:
+        # Append the label-backfill / public-test period (time_id 888480+) as
+        # extra training rows. These are the closest training data to the
+        # private-LB live period. pl.concat keeps the lazy scan; time ordering
+        # is preserved (extra rows have larger time_ids than main train).
+        extra_files = sorted(Path(args.extra_train_dir).glob("train_partition_*.parquet"))
+        if not extra_files:
+            extra_files = sorted(Path(args.extra_train_dir).glob("*.parquet"))
+        if args.extra_train_partitions is not None:
+            extra_files = extra_files[:args.extra_train_partitions]
+        if not extra_files:
+            raise FileNotFoundError(f"no parquet found under --extra-train-dir {args.extra_train_dir}")
+        print(f"  appending {len(extra_files)} extra-train partition(s) from {args.extra_train_dir}")
+        frame = pl.concat([frame, pl.scan_parquet([str(f) for f in extra_files])], how="diagonal_relaxed")
 
     time_ids = (
         frame.select("time_id").unique().sort("time_id").collect()["time_id"]
